@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         🥇超星学习通网课小助手|精简修复版(路由/视频暂停/弹题自动作答)
 // @namespace    noshuang
-// @version      0.4.1
+// @version      0.4.5
 // @author       Modified
 // @description  修复手动切换页面卡死；视频/音频自动静音播放，PPT/PDF 自动翻阅；非弹题暂停 3 秒恢复；视频内弹题不绕过——弹窗打开期间绝不自动恢复播放，由脚本自动作答（支持 window.__CX_AUTO_ANSWER 配置题库/自定义 provider，默认排除法试答），弹窗关闭后才继续播放；章节级习题仍跳过。
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -70,9 +70,75 @@
         } catch (e) { return false; }
     };
 
+    const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+    // 模拟人工单击：mousedown/mouseup + 单次 click()。
+    // 关键：绝不补发第二个合成 click —— label 先被 click() 勾上、再被补发 click 取消 = 等于没选（之前多选全错的根因）。
     const clickEl = (el) => {
-        try { el.click(); } catch (e) {}
-        try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: el.ownerDocument && el.ownerDocument.defaultView })); } catch (e) {}
+        try {
+            const r = el.getBoundingClientRect();
+            const w = Math.max(1, Math.round(r.width));
+            const h = Math.max(1, Math.round(r.height));
+            const x = r.left + randInt(2, Math.max(3, w - 2));
+            const y = r.top + randInt(2, Math.max(3, h - 2));
+            const base = { bubbles: true, cancelable: true, view: el.ownerDocument && el.ownerDocument.defaultView, clientX: x, clientY: y, button: 0 };
+            el.dispatchEvent(new MouseEvent('mousedown', base));
+            el.dispatchEvent(new MouseEvent('mouseup', base));
+            el.click();
+        } catch (e) {
+            try { el.click(); } catch (_) {}
+        }
+    };
+
+    const selectPicks = async (doc, picks, isMulti) => {
+        try {
+            const pickTexts = new Set(picks.map(p => normalizeText(p.text)));
+            const inputs = Array.from(doc.querySelectorAll('input[type="checkbox"], input[type="radio"]'));
+            const clickableOf = (el) => {
+                try { return el.closest('.ans-videoquiz-opt, .ans-cc, label, li, [class*="option" i]') || el; } catch (e) { return el; }
+            };
+
+            // 1) 多选：先取消已勾选项（模拟人工清空，防选项累积）
+            if (isMulti) {
+                for (const inp of inputs) {
+                    if (!inp.checked) continue;
+                    clickEl(clickableOf(inp));
+                    await sleep(randInt(15, 35) / 100);
+                }
+            }
+
+            // 2) 逐个点击目标选项，带人工节奏
+            for (const p of picks) {
+                const root = clickableOf(p.el);
+                clickEl(root);
+                await sleep(randInt(30, 60) / 100);
+                const inp = root.querySelector ? root.querySelector('input[type="checkbox"], input[type="radio"]') : null;
+                if (inp && !inp.checked) {
+                    clickEl(inp); // 容器点击未被识别时，直接点 input
+                    await sleep(randInt(20, 40) / 100);
+                }
+            }
+
+            // 3) 最终校验：勾选状态必须与目标一致（仍优先走点击路径，极端情况才强设）
+            for (const inp of inputs) {
+                const holder = inp.closest('.ans-videoquiz-opt, label, li, [class*="option" i]') || inp.parentElement;
+                const hText = holder ? normalizeText(holder.textContent) : '';
+                if (!hText) continue;
+                const want = [...pickTexts].some(t => hText.includes(t) || t.includes(hText));
+                if (!!inp.checked !== want) {
+                    clickEl(clickableOf(inp)); // 先按交互路径再点一次
+                    await sleep(randInt(20, 35) / 100);
+                    if (!!inp.checked !== want) {
+                        try {
+                            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
+                            setter.call(inp, want);
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                        } catch (e) { inp.checked = want; }
+                    }
+                }
+            }
+        } catch (e) {}
     };
 
     const classStr = (el) => {
@@ -249,9 +315,8 @@
                     const holder = inp.closest('label, li, .ans-cc, [class*="option" i], .choice, .marking_choice, .topic_option, .optionItem, .selectItem, .itemRow') || inp;
                     add(holder);
                 });
-                if (out.length === 0) {
-                    root.querySelectorAll('.ans-cc, .answerOption, .queOption, [class*="option" i], .choice, .marking_choice, .topic_option, .optionItem, .selectItem, .itemRow, .stem_answer, .subject_option, li.topic_item, .optionList li, .answerList li, .marking_choice li, .topicOptionDiv, .singleOption, .choiceItem, .selectOption, .ans-videoquiz-opt label, .ans-videoquiz label').forEach(add);
-                }
+                // 显式选项容器：不依赖 input，避免“部分选项有 input、部分没有”时漏采（如 WDM 丢失）
+                root.querySelectorAll('.ans-videoquiz-opt label, .ans-videoquiz label, .ans-cc, .answerOption, .queOption, [class*="option" i], .choice, .marking_choice, .topic_option, .optionItem, .selectItem, .itemRow, .stem_answer, .subject_option, li.topic_item, .optionList li, .answerList li, .marking_choice li, .topicOptionDiv, .singleOption, .choiceItem, .selectOption').forEach(add);
             } catch (e) {}
         });
         return out;
@@ -325,6 +390,15 @@
     };
     const getQuestionText = (el) => normalizeText((el && el.textContent || '').slice(0, 300));
 
+    const isMultiChoice = (doc) => {
+        try {
+            if (doc.querySelector('input[type="checkbox"]')) return true;
+            const vq = doc.querySelector('.ans-videoquiz');
+            if (vq && /多选题|多选|多项选择|以下哪些|以下哪几项/.test((vq.textContent || '').slice(0, 300))) return true;
+        } catch (e) {}
+        return false;
+    };
+
     const getConfiguredAnswer = async (qText, options) => {
         const cfg = window.__CX_AUTO_ANSWER || {};
         if (cfg.answers) {
@@ -395,30 +469,57 @@
                 markedCorrect.forEach(o => state.tried.add(o.text));
                 return { picks: markedCorrect, fills: [] };
             }
-            const isMulti = !!doc.querySelector('input[type="checkbox"]');
+            const isMulti = isMultiChoice(doc);
             if (isMulti) {
+                if (state.fullCycleDone) {
+                    return { picks: [], fills: [], reason: '全部组合已尝试完毕，请配置答案' };
+                }
                 const cands = options.filter(o => !state.wrong.has(o.text));
-                const combos = [];
-                for (let size = 1; size <= Math.min(3, cands.length); size++) {
-                    for (const combo of combinations(cands, size)) {
-                        const key = combo.map(c => c.text).sort().join('|');
-                        if (!state.tried.has(key)) {
-                            state.tried.add(key);
-                            combos.push(combo);
-                            if (combos.length >= 10) break;
+                const keyNow = cands.map(c => c.text).sort().join('|');
+                // 缓存全量组合并按序推进（跨轮次用 comboIndex 续走），不再每次重新洗牌
+                if (!state.combosKey || state.combosKey !== keyNow) {
+                    state.combos = [];
+                    const n = cands.length;
+                    const maxSize = n > 8 ? Math.min(4, n) : n;
+                    for (let size = 1; size <= maxSize; size++) {
+                        for (const combo of combinations(cands, size)) {
+                            state.combos.push(combo);
                         }
                     }
-                    if (combos.length >= 10) break;
-                }
-                if (combos.length) return { picks: combos[0], fills: [] };
-                // 组合试尽后重置尝试记录，避免卡死
-                if (state.tried.size) {
+                    if (n > 8) state.combos.push(cands.slice()); // 全选兜底
+                    state.combosKey = keyNow;
+                    state.comboIndex = 0;
                     state.tried.clear();
-                    const single = cands.find(o => !state.wrong.has(o.text));
-                    if (single) {
-                        state.tried.add(single.text);
-                        return { picks: [single], fills: [] };
+                    state.fullCycleDone = false;
+                    state.cycleLogAt = 0;
+                    Logger.addLog(
+                        n > 8
+                            ? `多选题选项较多(${n}个)，枚举 1~4 项及全选（${state.combos.length} 种），建议配置答案`
+                            : `多选题共 ${state.combos.length} 种组合，将按序尝试`,
+                        'primary'
+                    );
+                }
+                let pick = null;
+                while (state.comboIndex < state.combos.length) {
+                    const combo = state.combos[state.comboIndex++];
+                    const key = combo.map(c => c.text).sort().join('|');
+                    if (!state.tried.has(key)) {
+                        state.tried.add(key);
+                        pick = combo;
+                        break;
                     }
+                }
+                // 全量组合已彻底穷尽：停止试错（避免 5/6 选项 63 种组合无限重试），等待配置答案
+                if (!pick && state.combos.length) {
+                    state.fullCycleDone = true;
+                    state.comboIndex = 0;
+                    state.tried.clear();
+                    return { picks: [], fills: [], reason: '全部组合已尝试完毕，请配置答案' };
+                }
+                if (pick) {
+                    // 用最新 DOM 元素映射，避免容器重绘后旧节点失效
+                    const fresh = pick.map(p => options.find(o => o.text === p.text) || p);
+                    return { picks: fresh, fills: [] };
                 }
             } else {
                 const cand = options.find(o => !state.tried.has(o.text) && !state.wrong.has(o.text));
@@ -462,6 +563,17 @@
      */
     const answerPopupOnce = async (blocked, ctx, state) => {
         const { doc, rootEl } = ctx;
+
+        // 全量组合已试完：不再刷屏重试，仅节流提示（不强制恢复播放）
+        if (state.fullCycleDone) {
+            const nowL = Date.now();
+            if (!state.cycleLogAt || nowL - state.cycleLogAt >= 30000) {
+                state.cycleLogAt = nowL;
+                Logger.addLog('该多选题全部组合已尝试仍未答对。请配置 window.__CX_AUTO_ANSWER.answers 后刷新，或手动完成（弹窗不会自动关闭、不会强制恢复播放）', 'danger');
+            }
+            return false;
+        }
+
         const qEl = findQuestionEl(doc, rootEl);
         const qText = getQuestionText(qEl);
         Logger.addLog(`自动作答弹题：${qText.slice(0, 50) || '(未识别题干)'}`, 'warning');
@@ -482,25 +594,34 @@
         }
 
         const options = collectOptions(doc, rootEl);
-        const isMulti = !!doc.querySelector('input[type="checkbox"]');
-        const maxAttempts = Math.min(14, Math.max(4, (options.length || 2) * (isMulti ? 2 : 1) + 1));
+        const isMulti = isMultiChoice(doc);
+        // 多选题：给足轮次推进全量组合（选项更多时跨多轮继续，不会中途洗牌重来）
+        const maxAttempts = isMulti
+            ? Math.min(30, Math.max(10, (options.length || 2) * 5)) // 5选项25次/轮、6选项30次/轮，跨轮续走
+            : Math.min(14, Math.max(6, (options.length || 2) * 2 + 1));
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             if (!findQuizOverlayInChain(blocked.doc)) return true;
 
             const res = await determinePicks(ctx, state, qText);
             if (res.picks.length === 0 && !(res.fills && res.fills.length)) {
+                // 全量组合试完后的提示做节流，避免每 2.5 秒刷屏
+                const nowLog = Date.now();
+                if (res.reason === '全部组合已尝试完毕，请配置答案' && state.cycleLogAt && nowLog - state.cycleLogAt < 30000) {
+                    return false;
+                }
+                state.cycleLogAt = nowLog;
                 Logger.addLog(`自动作答失败：${res.reason || '无可用选项'}（第 ${attempt} 次）`, 'danger');
                 return false;
             }
             if (res.picks.length) {
                 Logger.addLog(`弹题第 ${attempt} 次选择：${res.picks.map(p => p.text).join('、')}`, 'primary');
-                res.picks.forEach(o => clickEl(o.el));
-                await sleep(0.4);
+                await selectPicks(doc, res.picks, isMulti); // 模拟人工勾选：清空→逐个点→校验
+                await sleep(randInt(30, 60) / 100);
             }
             const submit = findSubmitBtn(doc, rootEl);
             if (submit) clickEl(submit);
-            await sleep(2);
+            await sleep(randInt(18, 25) / 10); // 1.8~2.5s 人工反馈等待
 
             if (!findQuizOverlayInChain(blocked.doc)) {
                 Logger.addLog('弹题作答完成，弹窗已关闭', 'success');
@@ -554,6 +675,7 @@
         triedMap: new Map(),
         wrongMap: new Map(),
         qTextMap: new Map(),
+        stateMap: new Map(),
         async start(blocked) {
             const key = overlayKey(blocked);
             if (key !== this.currentKey) {
@@ -568,22 +690,44 @@
                     Logger.addLog('弹题窗口跨域不可访问，无法自动作答（不会强制恢复播放）', 'danger');
                     return;
                 }
-                // 同一弹窗地址内换了新题 → 重置本题的尝试/判错记录
+                // 同一弹窗地址内换了新题 → 重置本题的尝试/判错/组合进度
                 const qEl = findQuestionEl(ctx.doc, ctx.rootEl);
                 const qText = getQuestionText(qEl);
                 const prevQ = this.qTextMap.get(key);
                 if (prevQ && qText && prevQ !== qText) {
                     this.triedMap.set(key, new Set());
                     this.wrongMap.set(key, new Set());
+                    this.stateMap.delete(key);
                 }
                 if (qText) this.qTextMap.set(key, qText);
-                const state = {
-                    tried: this.triedMap.get(key),
-                    wrong: this.wrongMap.get(key),
-                    correct: new Set()
-                };
+
+                // state 跨轮持久：多选题的组合枚举进度(algo combos/comboIndex)不会每轮重来
+                let state = this.stateMap.get(key);
+                if (!state) {
+                    state = {
+                        tried: this.triedMap.get(key),
+                        wrong: this.wrongMap.get(key),
+                        correct: new Set(),
+                        combos: null,
+                        combosKey: '',
+                        comboIndex: 0,
+                        fullCycleDone: false,
+                        cycleLogAt: 0
+                    };
+                    this.stateMap.set(key, state);
+                } else {
+                    state.tried = this.triedMap.get(key);
+                    state.wrong = this.wrongMap.get(key);
+                }
+
                 const ok = await answerPopupOnce(blocked, ctx, state);
-                if (ok) this.currentKey = '';
+                if (ok) {
+                    this.currentKey = '';
+                    this.stateMap.delete(key);
+                    this.triedMap.delete(key);
+                    this.wrongMap.delete(key);
+                    this.qTextMap.delete(key);
+                }
             } catch (e) {
                 Logger.addLog('自动作答异常：' + (e && e.message || e), 'danger');
             } finally {
