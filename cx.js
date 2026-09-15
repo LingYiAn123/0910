@@ -1,27 +1,25 @@
 // ==UserScript==
-// @name         🥇网课小助手|超星学习通+优学院+知到(智慧树)
+// @name         🥇网课小助手|超星学习通+优学院
 // @namespace    noshuang
-// @version      0.6.6
+// @version      0.8.0
 // @author       Modified
-// @description  ①超星：自动播放视频/音频、PPT/PDF翻阅、视频弹题自动作答。②优学院：仅自动学习课件前6专题、拟人节奏、不做题。③知到(智慧树)：视频自动学习、弹题自动作答、不拖进度不加速、拟人防检测。面板开关可持久化，支持自定义 AI 模型提供方(API/模型/思考强度)。
+// @description  ①超星：自动播放视频/音频、PPT/PDF翻阅、章节任务点自动作答（只保存不提交）。②优学院：仅自动学习课件前6专题、拟人节奏、不做题。面板开关可持久化，支持自定义 AI 模型提供方(API/模型/思考强度)。
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
 // @match        *://*.ulearning.cn/*
 // @match        *://ulearning.cn/*
-// @match        *://*/*learnCourse*
-// @match        *://*.moocpeople.cn/*
-// @match        *://studyh5.zhihuishu.com/videoStudy.html*
-// @match        *://*.zhihuishu.com/*
-// @grant        none
-// @run-at       document-idle
+// @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
     'use strict';
 
     const isYxyHost = /ulearning/i.test(location.hostname || '');
-    const isZhsHost = /zhihuishu/i.test(location.hostname || '');
-    // 优学院/知到允许在 iframe 内运行（学习页可能在框架中）；超星仍只运行顶层
-    if (window.top !== window.self && !isYxyHost && !isZhsHost) return;
+    // 优学院允许在 iframe 内运行（学习页可能在框架中）；超星仍只运行顶层
+    if (window.top !== window.self && !isYxyHost) return;
+
+    // 页面真实 window：@grant unsafeWindow 时优先用它读页面全局（videojs / __CX_AUTO_ANSWER 等）
+    const pageWin = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
 
     /* ================= 持久化存储（仅偏好设置，不含任何账号/隐私数据） ================= */
     const STORE_KEY = 'nc_assistant_settings_v1';
@@ -34,9 +32,8 @@
     const DEFAULTS = {
         cx: true,        // 超星引擎
         yxy: true,       // 优学院引擎
-        zhs: true,       // 知到(智慧树)引擎
         limit6: true,    // 优学院只学前 6 个专题
-        answerPop: true, // 视频/课程中间弹题自动作答
+        answerPop: false, // 视频/课程中间弹题自动作答（默认关：作答行为最易触发风控，需要时再开）
         answerTask: false, // 任务点题目自动作答（默认关，风控更稳）
         humanize: true,  // 拟人操作（随机节奏/防挂机）
         aiEnabled: false, // 是否启用 AI 作答
@@ -84,6 +81,23 @@
 
     /* ================= 日志面板（懒创建：只有进入支持的页面才显示） ================= */
     let Logger = null;
+    // 安全日志：Logger 可能尚未创建（懒加载）或创建失败（页面异常）——
+    // 全脚本统一走 log()，杜绝 "Cannot read properties of null (reading 'addLog')" 崩溃
+    const log = (msg, type) => {
+        try {
+            if (!Logger) {
+                Logger = ensureLogger();
+            } else if (Logger.__host && !Logger.__host.isConnected) {
+                // 宿主被页面(SPA)摘掉 → 重新挂载（每次记日志都检查，保证自愈）
+                try {
+                    const mountRoot = document.body || document.documentElement;
+                    if (mountRoot) mountRoot.appendChild(Logger.__host);
+                } catch (e) {}
+            }
+            // 必须调 Logger.addLog —— 调用 log() 会无限递归导致栈溢出（面板消失/脚本全崩的根因）
+            if (Logger && Logger.addLog) Logger.addLog(msg, type);
+        } catch (e) {}
+    };
     const PANEL_CSS = `
         .nc-panel{position:fixed;top:120px;right:20px;width:344px;background:#fff;border-radius:12px;
             box-shadow:0 10px 32px rgba(15,23,42,.18);z-index:999999;font-size:13px;
@@ -120,12 +134,32 @@
             background:#e2e8f0;color:#64748b;font-size:10px;cursor:help;margin-left:2px;}
     `;
     const ensureLogger = () => {
-        if (Logger) return Logger;
-        if (!document.getElementById('nc-panel-style')) {
+        if (Logger) {
+            // 自愈：页面(SPA)可能把宿主节点摘掉，此时 Logger 仍在但面板不可见 →
+            // 检测挂载状态并重新挂载，避免"日志消失、重启也不显示"
+            try {
+                if (Logger.__host && !Logger.__host.isConnected) {
+                    const root = document.body || document.documentElement;
+                    if (root) root.appendChild(Logger.__host);
+                }
+            } catch (e) {}
+            return Logger;
+        }
+
+        /* 面板整体放入 closed Shadow DOM：
+         *  - 页面 JS 无法通过 document.querySelector('.nc-panel') 扫到内部节点
+         *  - 宿主节点用中性标签，且不含任何可识别属性
+         *  - 页面移除宿主时，下一次记日志会自愈重挂 */
+        const hostEl = document.createElement('div');
+        try { hostEl.style.cssText = 'all:initial;'; } catch (e) {}
+        let shadow = null;
+        try { shadow = hostEl.attachShadow({ mode: 'closed' }); } catch (e) { shadow = null; }
+        const root = shadow || hostEl;   // 极老浏览器不支持 shadow 时退化为普通挂载
+
+        if (shadow) {
             const st = document.createElement('style');
-            st.id = 'nc-panel-style';
             st.textContent = PANEL_CSS;
-            (document.head || document.documentElement).appendChild(st);
+            root.appendChild(st);
         }
 
         const container = document.createElement('div');
@@ -133,7 +167,7 @@
 
         const header = document.createElement('div');
         header.className = 'nc-hd';
-        header.innerHTML = `<span>网课小助手</span><span class="nc-tag">v0.6.6</span><span class="nc-min" title="折叠/展开">—</span>`;
+        header.innerHTML = `<span>网课小助手</span><span class="nc-tag">v0.8.0</span><span class="nc-min" title="折叠/展开">—</span>`;
         const minBtn = header.querySelector ? header.querySelector('.nc-min') : null;
 
         const body = document.createElement('div');
@@ -165,7 +199,7 @@
             cb.addEventListener('change', () => {
                 Settings[key] = cb.checked;
                 saveSettings();
-                if (Logger) Logger.addLog((cb.checked ? '已开启：' : '已关闭：') + label, 'primary');
+                if (Logger) log((cb.checked ? '已开启：' : '已关闭：') + label, 'primary');
             });
             lab.appendChild(cb);
             lab.appendChild(document.createTextNode(label));
@@ -193,7 +227,6 @@
         const secEngine = mkSec('平台引擎', false);
         secEngine.bd.appendChild(mkSwitch('超星', 'cx', '超星学习通自动学习'));
         secEngine.bd.appendChild(mkSwitch('优学院', 'yxy', '优学院自动学习'));
-        secEngine.bd.appendChild(mkSwitch('知到', 'zhs', '智慧树/知到自动学习'));
         secEngine.bd.appendChild(mkSwitch('优学院前6专题', 'limit6', '只学前6个专题，防反作弊'));
         secEngine.bd.appendChild(mkSwitch('拟人操作', 'humanize', '随机节奏、防挂机检测'));
 
@@ -339,7 +372,7 @@
             if (probeKey === lastProbe.key && now - lastProbe.at < 60000 && Settings.aiModels && Settings.aiModels.length) {
                 renderModels(Settings.aiModels, Settings.aiModel);
                 syncEffort();
-                Logger.addLog(`复用 ${now - lastProbe.at < 60000 ? '60 秒内' : ''}已探测的 ${Settings.aiModels.length} 个模型`, 'primary');
+                log(`复用 ${now - lastProbe.at < 60000 ? '60 秒内' : ''}已探测的 ${Settings.aiModels.length} 个模型`, 'primary');
                 return;
             }
             probeBtn.disabled = true;
@@ -347,7 +380,7 @@
             probeBtn.textContent = '探测中…';
             if (!Logger) ensureLogger();
             try {
-                Logger.addLog(`正在探测模型：${Settings.aiBaseURL}`, 'primary');
+                log(`正在探测模型：${Settings.aiBaseURL}`, 'primary');
                 const r = await probeModels();
                 Settings.aiModels = r.ids;
                 Settings.aiModelMeta = r.meta;
@@ -356,9 +389,9 @@
                 lastProbe = { key: probeKey, at: Date.now() };
                 renderModels(r.ids, Settings.aiModel);
                 syncEffort();
-                Logger.addLog(`探测成功：发现 ${r.ids.length} 个模型`, 'success');
+                log(`探测成功：发现 ${r.ids.length} 个模型`, 'success');
             } catch (e) {
-                Logger.addLog('模型探测失败：' + ((e && e.message) || e), 'danger');
+                log('模型探测失败：' + ((e && e.message) || e), 'danger');
             } finally {
                 probeBtn.disabled = false;
                 probeBtn.textContent = oldText;
@@ -385,9 +418,13 @@
         effortSel.style.width = '100%';
         const effortHint = document.createElement('span');
         effortHint.style.cssText = 'flex:1;font-size:11px;color:#94a3b8;';
+        // 未探测时的兜底：从 BaseURL 推断服务商（用户可能没点“探测”就直接填了模型）
+        const inferProvider = () => /deepseek\.com/i.test(Settings.aiBaseURL || '') ? 'deepseek' : 'openai';
         const effortOptionsFor = (model) => {
             const meta = (Settings.aiModelMeta || {})[model];
-            return (meta && meta.efforts && meta.efforts.length) ? meta.efforts : AI_EFFORTS.slice();
+            if (meta && meta.efforts && meta.efforts.length) return meta.efforts;
+            // 未探测：DeepSeek 官方三档，其余完整五档
+            return inferProvider() === 'deepseek' ? ['off', 'low', 'high', 'max'] : AI_EFFORTS.slice();
         };
         const isAdjustableModel = (model) => {
             const meta = (Settings.aiModelMeta || {})[model];
@@ -419,7 +456,11 @@
             });
             if (opts.indexOf(Settings.aiEffort) === -1) Settings.aiEffort = opts[0];
             effortSel.value = Settings.aiEffort;
-            effortHint.textContent = `该模型支持思考等级：${opts.map(e => EFFORT_LABEL[e] || e).join(' / ')}（选“关闭思考”才是真正关闭）`;
+            const metaNow = (Settings.aiModelMeta || {})[Settings.aiModel];
+            const isDS = !!(metaNow && metaNow.provider === 'deepseek');
+            effortHint.textContent = isDS
+                ? `DeepSeek 官方档位：${opts.map(e => EFFORT_LABEL[e] || e).join(' / ')}（官方仅 low/high/max 三档，默认 high；“关闭思考”= thinking.type=disabled）`
+                : `该模型支持思考等级：${opts.map(e => EFFORT_LABEL[e] || e).join(' / ')}（选“关闭思考”才是真正关闭）`;
         };
         effortSel.addEventListener('change', () => { Settings.aiEffort = effortSel.value; saveSettings(); });
         const effortWrap = document.createElement('span');
@@ -455,20 +496,31 @@
 
         container.appendChild(header);
         container.appendChild(body);
-        document.body.appendChild(container);
+        root.appendChild(container);
+
+        // @run-at document-start 时 body 可能还不存在 → 等 DOM 就绪再挂载（否则面板永远建不出来）
+        const mountPanel = () => {
+            try {
+                const mountRoot = document.body || document.documentElement;
+                if (!mountRoot) { setTimeout(mountPanel, 50); return; }
+                if (!hostEl.parentElement) mountRoot.appendChild(hostEl);
+            } catch (e) { setTimeout(mountPanel, 100); }
+        };
+        mountPanel();
 
         let isDragging = false, offsetX, offsetY;
         header.onmousedown = (e) => {
             if (e.target.classList.contains('nc-min')) return;
             isDragging = true; offsetX = e.clientX - container.offsetLeft; offsetY = e.clientY - container.offsetTop;
         };
-        document.addEventListener('mousemove', (e) => {
+        // 拖拽监听挂在 Shadow 根上（不污染页面 document，减少可探测痕迹）
+        root.addEventListener('mousemove', (e) => {
             if (!isDragging) return;
             container.style.left = (e.clientX - offsetX) + 'px';
             container.style.top = (e.clientY - offsetY) + 'px';
             container.style.right = 'auto';
         });
-        document.addEventListener('mouseup', () => { isDragging = false; });
+        root.addEventListener('mouseup', () => { isDragging = false; });
         if (minBtn) {
             minBtn.addEventListener('click', () => {
                 body.style.display = body.style.display === 'none' ? '' : 'none';
@@ -478,6 +530,9 @@
         const colors = { primary: '#2563eb', success: '#16a34a', warning: '#d97706', danger: '#dc2626' };
 
         Logger = {
+            __host: hostEl,        // Shadow DOM 宿主（供自愈检测）
+            __shadow: shadow,      // closed shadow 根（仅脚本内可访问）
+            __logArea: logArea,
             addLog: (msg, type = 'primary') => {
                 try {
                     const time = new Date().toLocaleTimeString();
@@ -492,9 +547,9 @@
         try {
             const norm = (typeof normalizeBaseURL === 'function') ? normalizeBaseURL : (x) => (x || '');
             const base = norm(Settings.aiBaseURL);
-            Logger.addLog(`面板配置已加载：AI=${Settings.aiEnabled ? '开' : '关'}｜模型=${Settings.aiModel || '(空)'}｜接口=${base || '(空)'}`, 'primary');
+            log(`面板配置已加载：AI=${Settings.aiEnabled ? '开' : '关'}｜模型=${Settings.aiModel || '(空)'}｜接口=${base || '(空)'}`, 'primary');
             if (Settings.aiEnabled && (!base || !Settings.aiModel)) {
-                Logger.addLog('注意：AI 已开启但配置不完整，答题时会报“未配置完整”，请填写 BaseURL 并选择模型', 'warning');
+                log('注意：AI 已开启但配置不完整，答题时会报“未配置完整”，请填写 BaseURL 并选择模型', 'warning');
             }
         } catch (e) {}
         return Logger;
@@ -521,22 +576,112 @@
 
     const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-    // 模拟人工单击：mousedown/mouseup + 单次 click()。
-    // 关键：绝不补发第二个合成 click —— label 先被 click() 勾上、再被补发 click 取消 = 等于没选（之前多选全错的根因）。
-    const clickEl = (el) => {
-        try {
+    /* ================= 真人输入模拟层（三平台通用） =================
+     * 与旧式 el.click() 的区别（这是被检测的关键差异）：
+     *  1) 真人 click 事件坐标 = 光标坐标；el.click() 的坐标恒为 (0,0) —— 经典机器人特征；
+     *  2) 真人点击前鼠标有连续移动轨迹（pointermove/mousemove 多步），且 target 是光标下元素；
+     *  3) 真人按下/抬起之间有 60~160ms 间隔，且有完整 pointerdown/pointerup 序列；
+     *  4) 真人操作之间有阅读/犹豫停顿，而不是固定节奏。
+     */
+    const Human = {
+        // 当前“虚拟光标”位置（页面级状态，跨调用连续）
+        x: 0, y: 0, inited: false,
+
+        view(el) {
+            try { return el.ownerDocument && el.ownerDocument.defaultView || window; } catch (e) { return window; }
+        },
+
+        // 贝塞尔曲线路径生成（带随机控制点，模拟手腕弧线）
+        bezier(x1, y1, x2, y2) {
+            const cx1 = x1 + (x2 - x1) * randInt(20, 45) / 100 + randInt(-60, 60);
+            const cy1 = y1 + (y2 - y1) * randInt(20, 45) / 100 + randInt(-60, 60);
+            const cx2 = x1 + (x2 - x1) * randInt(55, 85) / 100 + randInt(-40, 40);
+            const cy2 = y1 + (y2 - y1) * randInt(55, 85) / 100 + randInt(-40, 40);
+            const steps = Math.max(6, Math.min(16, Math.round(Math.hypot(x2 - x1, y2 - y1) / 60)));
+            const pts = [];
+            for (let i = 1; i <= steps; i++) {
+                const t = i / steps;
+                const u = 1 - t;
+                pts.push({
+                    x: u * u * u * x1 + 3 * u * u * t * cx1 + 3 * u * t * t * cx2 + t * t * t * x2,
+                    y: u * u * u * y1 + 3 * u * u * t * cy1 + 3 * u * t * t * cy2 + t * t * t * y2
+                });
+            }
+            return pts;
+        },
+
+        // 光标连续移动到 (x,y)：多步 mousemove/pointermove，target 取各步命中元素
+        // doc：元素所在文档（iframe 内元素的坐标是 iframe 视口坐标，必须用它自己的 elementFromPoint）
+        async move(x, y, doc) {
+            const from = this.inited ? { x: this.x, y: this.y }
+                : { x: randInt(40, Math.max(80, (window.innerWidth || 1280) - 40)), y: randInt(40, Math.max(80, (window.innerHeight || 800) - 40)) };
+            this.inited = true;
+            const hitDoc = doc || document;
+            const pts = this.bezier(from.x, from.y, x, y);
+            for (const p of pts) {
+                const tgt = (() => { try { return hitDoc.elementFromPoint(p.x, p.y) || hitDoc; } catch (e) { return hitDoc; } })();
+                try {
+                    tgt.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window, clientX: p.x, clientY: p.y }));
+                    if (typeof PointerEvent === 'function') {
+                        tgt.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, view: window, clientX: p.x, clientY: p.y, pointerType: 'mouse', isPrimary: true }));
+                    }
+                } catch (e) {}
+                await sleep(randInt(8, 25) / 1000); // 步间 8~25ms，模拟连续移动
+            }
+            this.x = x; this.y = y;
+        },
+
+        // 移动到元素中心附近（带随机偏移，不总是正中心）
+        async moveTo(el) {
             const r = el.getBoundingClientRect();
-            const w = Math.max(1, Math.round(r.width));
-            const h = Math.max(1, Math.round(r.height));
-            const x = r.left + randInt(2, Math.max(3, w - 2));
-            const y = r.top + randInt(2, Math.max(3, h - 2));
-            const base = { bubbles: true, cancelable: true, view: el.ownerDocument && el.ownerDocument.defaultView, clientX: x, clientY: y, button: 0 };
-            el.dispatchEvent(new MouseEvent('mousedown', base));
-            el.dispatchEvent(new MouseEvent('mouseup', base));
-            el.click();
-        } catch (e) {
-            try { el.click(); } catch (_) {}
-        }
+            const w = Math.max(1, r.width), h = Math.max(1, r.height);
+            const x = r.left + w * randInt(30, 70) / 100;
+            const y = r.top + h * randInt(30, 70) / 100;
+            await this.move(x, y, el.ownerDocument);
+            return { x, y };
+        },
+
+        // 真人单击：move → over → down(60~160ms) → up → click（坐标一致，不用 el.click()）
+        async click(el) {
+            if (!el) return;
+            try { await el.scrollIntoViewIfNeeded ? el.scrollIntoViewIfNeeded() : null; } catch (e) {}
+            const pos = await this.moveTo(el);
+            const doc = el.ownerDocument || document;
+            const win = this.view(el);
+            const fire = (type, Ctor) => {
+                try {
+                    const init = {
+                        bubbles: true, cancelable: true, view: win,
+                        clientX: pos.x, clientY: pos.y, button: 0
+                    };
+                    if (Ctor === PointerEvent && typeof PointerEvent === 'function') {
+                        init.pointerId = 1; init.pointerType = 'mouse'; init.isPrimary = true;
+                        el.dispatchEvent(new PointerEvent(type, init));
+                    } else {
+                        el.dispatchEvent(new MouseEvent(type, init));
+                    }
+                } catch (e) {}
+            };
+            // over/down/up 全部带一致坐标
+            fire('mouseover'); fire('mouseenter', MouseEvent);
+            fire('pointerover', PointerEvent); fire('pointerdown', PointerEvent);
+            fire('mousedown', MouseEvent);
+            await sleep(randInt(60, 160) / 1000); // 按住时长
+            fire('pointerup', PointerEvent);
+            fire('mouseup', MouseEvent);
+            // click 用合成事件（带坐标）而不是 el.click()（坐标恒 0,0）
+            try {
+                el.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true, cancelable: true, view: win,
+                    clientX: pos.x, clientY: pos.y, button: 0
+                }));
+            } catch (e) { try { el.click(); } catch (_) {} }
+        },
+
+        // 阅读停顿（读题/读页面）
+        async read(min, max) { await sleep(randInt(min || 2, max || 5)); },
+        // 微停顿（动作间犹豫）
+        async pause() { await sleep(randInt(20, 60) / 100); }
     };
 
     const selectPicks = async (doc, picks, isMulti) => {
@@ -551,19 +696,20 @@
             if (isMulti) {
                 for (const inp of inputs) {
                     if (!inp.checked) continue;
-                    clickEl(clickableOf(inp));
-                    await sleep(randInt(15, 35) / 100);
+                    await Human.click(clickableOf(inp));
+                    await sleep(randInt(20, 45) / 100);
                 }
             }
 
-            // 2) 逐个点击目标选项，带人工节奏
+            // 2) 逐个点击目标选项，真人节奏：读选项(0.8~2s)→点击→停顿
             for (const p of picks) {
                 const root = clickableOf(p.el);
-                clickEl(root);
+                await sleep(randInt(80, 200) / 100);
+                await Human.click(root);
                 await sleep(randInt(30, 60) / 100);
                 const inp = root.querySelector ? root.querySelector('input[type="checkbox"], input[type="radio"]') : null;
                 if (inp && !inp.checked) {
-                    clickEl(inp); // 容器点击未被识别时，直接点 input
+                    await Human.click(inp); // 容器点击未被识别时，直接点 input
                     await sleep(randInt(20, 40) / 100);
                 }
             }
@@ -575,7 +721,7 @@
                 if (!hText) continue;
                 const want = [...pickTexts].some(t => hText.includes(t) || t.includes(hText));
                 if (!!inp.checked !== want) {
-                    clickEl(clickableOf(inp)); // 先按交互路径再点一次
+                    await Human.click(clickableOf(inp)); // 先按交互路径再点一次
                     await sleep(randInt(20, 35) / 100);
                     if (!!inp.checked !== want) {
                         try {
@@ -858,13 +1004,16 @@
     const AI_FATAL_CODES = [401, 402, 403, 429];
 
     /**
-     * 构造思考参数。
-     * - 模型不支持思考（efforts 仅 ['off'] 或空）：**不发送任何思考参数**，
-     *   避免严格服务端因未知字段（reasoning_effort / enable_thinking）返回 400。
-     * - 模型支持思考：off = 关闭思考（显式传参关闭），其余档位映射到对应强度。
+     * 构造思考参数（按各家官方规格，不是“一套参数打天下”）：
+     * - DeepSeek 官方：`thinking:{type:enabled|disabled}` 开关 + `reasoning_effort:"low|high|max"`（仅三档）
+     * - 硅基流动/其他 OpenAI 兼容：`enable_thinking:bool` + `reasoning_effort:"low|medium|high"`
+     * - 不支持思考的模型：完全不传，避免严格服务端 400
      */
     const buildEffortParams = (effort, model) => {
         const meta = (Settings.aiModelMeta || {})[model];
+        // provider 兜底：未探测时从 BaseURL 判断（DeepSeek 官方参数格式与兼容端不同）
+        const provider = (meta && meta.provider)
+            || (/deepseek\.com/i.test(Settings.aiBaseURL || '') ? 'deepseek' : 'openai');
         // 优先看探测得到的能力标记；没有标记时按“支持”处理（用户可自选）
         const adjustable = (meta && typeof meta.adjustable === 'boolean')
             ? meta.adjustable
@@ -873,8 +1022,15 @@
         if (!adjustable || !effort) return {};
 
         if (effort === 'off') {
-            // 支持思考的模型，选择“关闭”才是真正关闭思考
-            return { reasoning_effort: 'none', enable_thinking: false };
+            // DeepSeek 官方用 thinking.type=disabled 关闭；其余兼容端用 enable_thinking:false
+            return provider === 'deepseek'
+                ? { thinking: { type: 'disabled' } }
+                : { reasoning_effort: 'none', enable_thinking: false };
+        }
+        if (provider === 'deepseek') {
+            // 官方仅 low / high / max 三档；medium 按官方映射表归到 high
+            const map = { low: 'low', medium: 'high', high: 'high', max: 'max' };
+            return { thinking: { type: 'enabled' }, reasoning_effort: map[effort] || 'high' };
         }
         const map = { low: 'low', medium: 'medium', high: 'high', max: 'high' };
         return { reasoning_effort: map[effort] || 'medium', enable_thinking: true };
@@ -912,10 +1068,10 @@
         const model = (Settings.aiModel || '').trim();
         if (!base || !model) {
             // 诊断：把当前实际读到的值打出来，便于定位是“面板有值但 Settings 空”的同步问题
-            Logger.addLog(`AI 未配置完整：BaseURL=${base ? '已填' : '空'}｜模型=${model || '空'}。请在面板填写并点“探测”选择模型后重试`, 'danger');
+            log(`AI 未配置完整：BaseURL=${base ? '已填' : '空'}｜模型=${model || '空'}。请在面板填写并点“探测”选择模型后重试`, 'danger');
             return null;
         }
-        if (!window.fetch) { Logger.addLog('当前浏览器不支持 fetch，AI 不可用', 'danger'); return null; }
+        if (!window.fetch) { log('当前浏览器不支持 fetch，AI 不可用', 'danger'); return null; }
 
         const cacheKey = model + '|' + qText + '|' + options.map(o => o.text).join('|');
         if (aiCache.has(cacheKey)) return aiCache.get(cacheKey);          // 命中缓存，直接复用
@@ -924,15 +1080,18 @@
         const optLines = options.map((o, i) => `${String.fromCharCode(65 + i)}. ${o.text}`).join('\n');
         const prompt = `你在帮学生作答网课选择题（可能单选/多选/判断）。\n题目：${qText}\n选项：\n${optLines}\n\n只输出最终答案，不要解释。单选/判断输出一个字母；多选输出多个字母，用英文逗号分隔（如 A,C,D）。`;
         const effortParams = buildEffortParams(Settings.aiEffort, model);
+        const isThinkingOn = !!(effortParams && (effortParams.thinking && effortParams.thinking.type === 'enabled'
+            || effortParams.enable_thinking === true));
         const basePayload = {
             model: model,
             messages: [
                 { role: 'system', content: '你是精确的答题引擎，只输出答案，不输出任何解释。' },
                 { role: 'user', content: prompt }
             ],
-            temperature: 0.2,
             stream: false
         };
+        // DeepSeek 官方：思考模式下 temperature 无效（官方明说不支持），此时不传更干净
+        if (!(isThinkingOn && /deepseek\.com/i.test(base))) basePayload.temperature = 0.2;
         // 仅在模型支持且用户选了档位时才附加思考参数（不可调整的模型绝不携带未知字段）
         const payload = Object.keys(effortParams).length ? Object.assign(basePayload, effortParams) : basePayload;
 
@@ -962,9 +1121,9 @@
                         aiBlocked.reason = reason;
                         let detail = '';
                         try { const j = await resp.json(); detail = (j && (j.message || j.error && j.error.message)) || ''; } catch (e) {}
-                        Logger.addLog(`AI 不可用：${reason}${detail ? '｜' + detail : ''}。已暂停 AI 调用 ${mins} 分钟，后续改用排除法`, 'danger');
+                        log(`AI 不可用：${reason}${detail ? '｜' + detail : ''}。已暂停 AI 调用 ${mins} 分钟，后续改用排除法`, 'danger');
                     } else {
-                        Logger.addLog(`AI 请求失败 HTTP ${code}（本轮跳过，转排除法）`, 'danger');
+                        log(`AI 请求失败 HTTP ${code}（本轮跳过，转排除法）`, 'danger');
                     }
                     return null;
                 }
@@ -973,18 +1132,18 @@
                 const letters = String(content).trim().toUpperCase().match(/[A-H]/g);
                 if (letters && letters.length) {
                     const texts = letters.map(l => options[l.charCodeAt(0) - 65] ? options[l.charCodeAt(0) - 65].text : l).filter(Boolean);
-                    Logger.addLog(`AI 作答：${texts.join('、')}`, 'success');
+                    log(`AI 作答：${texts.join('、')}`, 'success');
                     aiCache.set(cacheKey, texts);
                     return texts;
                 }
-                Logger.addLog('AI 未返回可用选项（转排除法）', 'warning');
+                log('AI 未返回可用选项（转排除法）', 'warning');
                 return null;
             } catch (e) {
                 const msg = (e && e.message) || e;
                 if (/abort/i.test(String(msg))) {
-                    Logger.addLog(`AI 超时（${Math.round(timeoutMs / 1000)}s 未返回），已降级为排除法继续作答`, 'warning');
+                    log(`AI 超时（${Math.round(timeoutMs / 1000)}s 未返回），已降级为排除法继续作答`, 'warning');
                 } else {
-                    Logger.addLog('AI 请求异常：' + msg + '（转排除法）', 'danger');
+                    log('AI 请求异常：' + msg + '（转排除法）', 'danger');
                 }
                 return null;
             } finally {
@@ -1001,7 +1160,7 @@
 
     // 纯本地答案：window.__CX_AUTO_ANSWER.answers / provider（不发起任何 AI 请求）
     const localConfiguredAnswer = (qText, options) => {
-        const cfg = window.__CX_AUTO_ANSWER || {};
+        const cfg = pageWin.__CX_AUTO_ANSWER || {};
         if (cfg.answers) {
             const qn = qText.replace(/\s+/g, '');
             for (const key of Object.keys(cfg.answers)) {
@@ -1041,42 +1200,56 @@
         const data = await resp.json();
         const list = (data && (data.data || data.models)) || [];
         const ids = list.map(m => (typeof m === 'string' ? m : (m.id || m.name))).filter(Boolean);
-        // 推断思考能力（参考 DSH 对 reasoning 模型的标注）：
-        // adjustable=true  → 可调档位（off/low/medium/high/max）
-        // adjustable=false → 不支持思考（无档位可调），请求时不会携带任何思考参数
-        // 若 /models 额外提供了 reasoning 能力字段，则优先采用服务端信息
+
+        // 识别服务商：决定用哪套思考参数（DeepSeek 官方与 OpenAI 兼容端格式不同）
+        const provider = /deepseek\.com/i.test(base) ? 'deepseek' : 'openai';
+
+        // 推断思考能力：
+        //  - DeepSeek 官方：deepseek-flash / deepseek-v4-pro 等均「默认开启思考，可切非思考」
+        //    → 档位为官方三档 low/high/max（面板另有“关闭思考”映射为 thinking.type=disabled）
+        //  - 其他兼容端：名字含 reason/thinking/r1/qwq/o1/o3/o4/qwen3(非coder)/glm-4.5+ 等 → 可调
+        //  - 服务端若返回能力字段则优先
         const meta = {};
         ids.forEach(item => {
             const id = typeof item === 'string' ? item : (item.id || item.name);
             const raw = typeof item === 'string' ? {} : item;
             let adjustable = null;
-            // 服务端能力字段优先（不同厂商字段名不同）
             if (raw && (raw.reasoning === true || raw.supports_reasoning === true || raw.capabilities && raw.capabilities.reasoning)) {
                 adjustable = true;
             } else if (raw && (raw.reasoning === false || raw.supports_reasoning === false)) {
                 adjustable = false;
             }
             if (adjustable === null) {
-                adjustable = /r1|reason|thinking|qwq|o1|o3|o4|deepseek-v3\.[12]\b|glm-4\.[56]|qwen3(?!-coder)/i.test(id);
+                if (provider === 'deepseek') {
+                    // 官方模型名（deepseek-flash / deepseek-v4-pro / 旧名 chat|reasoner）全部支持思考；
+                    // 仅明确标注非思考的才排除
+                    adjustable = !/embedding|rerank/i.test(id);
+                } else {
+                    adjustable = /reason|reasoner|thinking|r1|qwq|o1|o3|o4|qwen3(?!-coder)|glm-4\.[5-9]|deepseek-(v3\.[12]|r1|flash|v4)/i.test(id);
+                }
             }
             meta[id] = {
                 adjustable: adjustable,
-                efforts: adjustable ? ['off', 'low', 'medium', 'high', 'max'] : []
+                provider: provider,
+                // DeepSeek 官方只有三档；兼容端用四档
+                efforts: adjustable
+                    ? (provider === 'deepseek' ? ['off', 'low', 'high', 'max'] : ['off', 'low', 'medium', 'high', 'max'])
+                    : []
             };
         });
-        return { ids: ids.sort(), meta };
+        return { ids: ids.sort(), meta, provider };
     };
 
     const getConfiguredAnswer = async (qText, options) => {
         const local = localConfiguredAnswer(qText, options);
         if (local) return { answer: local, fromConfig: true };
-        const cfg = window.__CX_AUTO_ANSWER || {};
+        const cfg = pageWin.__CX_AUTO_ANSWER || {};
         if (typeof cfg.provider === 'function') {
             try {
                 const ans = await cfg.provider(qText, options.map(o => o.text));
                 if (ans) return { answer: Array.isArray(ans) ? ans.map(String) : [String(ans)], fromConfig: true };
             } catch (e) {
-                Logger.addLog('自定义答题 provider 出错: ' + (e && e.message || e), 'danger');
+                log('自定义答题 provider 出错: ' + (e && e.message || e), 'danger');
             }
         }
         return null;
@@ -1118,7 +1291,7 @@
             state.cfgQueried = true;
             const local = localConfiguredAnswer(qText, options.concat(judge));
             state.cfgAnswer = local || null;
-            state.cfgNeedProvider = !local && typeof (window.__CX_AUTO_ANSWER && window.__CX_AUTO_ANSWER.provider) === 'function';
+            state.cfgNeedProvider = !local && typeof (pageWin.__CX_AUTO_ANSWER && pageWin.__CX_AUTO_ANSWER.provider) === 'function';
         }
         if (!state.cfgAnswer && state.cfgNeedProvider && !state.cfgProviderLoading) {
             state.cfgProviderLoading = true;
@@ -1126,7 +1299,7 @@
                 state.cfgAnswer = res ? res.answer : null;
                 state.cfgProviderLoading = false;
             }).catch(() => { state.cfgProviderLoading = false; });
-            Logger.addLog('正在通过自定义 provider 取答案...', 'primary');
+            log('正在通过自定义 provider 取答案...', 'primary');
             return { picks: [], fills: [] };
         }
         if (state.cfgAnswer && !state.cfgTried) {
@@ -1149,11 +1322,12 @@
                     .catch(() => { state.aiAnswer = null; state.aiSettled = true; return null; });
             }
             if (!state.aiTried) {
+                // ==============================================================================
                 // 一直等 AI 返回（不设降级等待）；期间日志节流提示，避免刷屏
                 if (!state.aiAnswer && state.aiPromise && !state.aiSettled) {
                     const waitLog = setInterval(() => {
                         if (state.aiAnswer || state.aiSettled) { clearInterval(waitLog); return; }
-                        Logger.addLog('AI 思考中，保持等待（已禁用排除法，不会用猜测答案顶替）', 'primary');
+                        log('AI 思考中，保持等待（已禁用排除法，不会用猜测答案顶替）', 'primary');
                     }, 15000);
                     try {
                         await state.aiPromise;
@@ -1167,7 +1341,7 @@
                         const wait = aiBlocked.until > Date.now()
                             ? `（AI 熔断中：${aiBlocked.reason || 'Key/账户不可用'}，约 ${Math.ceil((aiBlocked.until - Date.now()) / 60000)} 分钟后重试）`
                             : '';
-                        Logger.addLog(`AI 未返回可用答案，本题改用排除法兜底${wait}`, 'warning');
+                        log(`AI 未返回可用答案，本题改用排除法兜底${wait}`, 'warning');
                     }
                     state.aiFallback = true;
                 } else {
@@ -1175,7 +1349,7 @@
                     const picks = (options.length ? options : judge).filter(o => state.aiAnswer.some(a => matchAnswer(o, a)));
                     if (picks.length) return { picks, fills: [] };
                     // AI 给的答案在选项中匹配不到 → 视为不可用
-                    if (!state.aiFallback) Logger.addLog('AI 返回的答案无法匹配当前选项，改用排除法兜底', 'warning');
+                    if (!state.aiFallback) log('AI 返回的答案无法匹配当前选项，改用排除法兜底', 'warning');
                     state.aiAnswer = null;
                     state.aiFallback = true;
                 }
@@ -1222,7 +1396,7 @@
                     state.tried.clear();
                     state.fullCycleDone = false;
                     state.cycleLogAt = 0;
-                    Logger.addLog(
+                    log(
                         n > 8
                             ? `多选题选项较多(${n}个)，枚举 1~4 项及全选（${state.combos.length} 种），建议配置答案`
                             : `多选题共 ${state.combos.length} 种组合，将按序尝试`,
@@ -1299,14 +1473,14 @@
             const nowL = Date.now();
             if (!state.cycleLogAt || nowL - state.cycleLogAt >= 30000) {
                 state.cycleLogAt = nowL;
-                Logger.addLog('该多选题全部组合已尝试仍未答对。请配置 window.__CX_AUTO_ANSWER.answers 后刷新，或手动完成（弹窗不会自动关闭、不会强制恢复播放）', 'danger');
+                log('该多选题全部组合已尝试仍未答对。请配置 window.__CX_AUTO_ANSWER.answers 后刷新，或手动完成（弹窗不会自动关闭、不会强制恢复播放）', 'danger');
             }
             return false;
         }
 
         const qEl = findQuestionEl(doc, rootEl);
         const qText = getQuestionText(qEl);
-        Logger.addLog(`自动作答弹题：${qText.slice(0, 50) || '(未识别题干)'}`, 'warning');
+        log(`自动作答弹题：${qText.slice(0, 50) || '(未识别题干)'}`, 'warning');
 
         let contentReady = false;
         for (let i = 0; i < 75; i++) {
@@ -1315,11 +1489,11 @@
                 contentReady = true;
                 break;
             }
-            if (i % 10 === 9) Logger.addLog('等待弹题内容加载...', 'primary');
+            if (i % 10 === 9) log('等待弹题内容加载...', 'primary');
             await sleep(0.2);
         }
         if (!contentReady) {
-            Logger.addLog('弹题内容未加载或跨域不可访问', 'danger');
+            log('弹题内容未加载或跨域不可访问', 'danger');
             return false;
         }
 
@@ -1339,20 +1513,20 @@
                 const nowLog = Date.now();
                 if (state.cycleLogAt && nowLog - state.cycleLogAt < 30000) return false;
                 state.cycleLogAt = nowLog;
-                Logger.addLog(`自动作答暂停：${res.reason || '无可用选项'}`, 'danger');
+                log(`自动作答暂停：${res.reason || '无可用选项'}`, 'danger');
                 return false;
             }
             if (res.picks.length) {
-                Logger.addLog(`弹题第 ${attempt} 次选择：${res.picks.map(p => p.text).join('、')}`, 'primary');
+                log(`弹题第 ${attempt} 次选择：${res.picks.map(p => p.text).join('、')}`, 'primary');
                 await selectPicks(doc, res.picks, isMulti); // 模拟人工勾选：清空→逐个点→校验
                 await sleep(randInt(30, 60) / 100);
             }
             const submit = findSubmitBtn(doc, rootEl);
-            if (submit) clickEl(submit);
+            if (submit) await Human.click(submit);
             await sleep(randInt(18, 25) / 10); // 1.8~2.5s 人工反馈等待
 
             if (!findQuizOverlayInChain(blocked.doc)) {
-                Logger.addLog('弹题作答完成，弹窗已关闭', 'success');
+                log('弹题作答完成，弹窗已关闭', 'success');
                 return true;
             }
 
@@ -1365,10 +1539,9 @@
                         const tt = (el.innerText || el.textContent || '').trim();
                         return tt === '继续学习' || tt.indexOf('继续') !== -1;
                     });
-                    if (btn) clickEl(btn);
-                    await sleep(0.8);
+                    if (btn) { await Human.click(btn); await sleep(0.8); }
                     try { if (vq.parentNode) vq.parentNode.removeChild(vq); } catch (e) {}
-                    Logger.addLog('弹题作答完成（答对），弹窗已关闭', 'success');
+                    log('弹题作答完成（答对），弹窗已关闭', 'success');
                     return true;
                 }
             }
@@ -1383,16 +1556,16 @@
             if (correctPicks.length) {
                 const close = findCloseBtn(doc, rootEl);
                 if (close) {
-                    clickEl(close);
+                    await Human.click(close);
                     await sleep(1.2);
                     if (!findQuizOverlayInChain(blocked.doc)) {
-                        Logger.addLog('弹题作答完成，弹窗已关闭', 'success');
+                        log('弹题作答完成，弹窗已关闭', 'success');
                         return true;
                     }
                 }
             }
         }
-        Logger.addLog('自动作答达到尝试上限，弹窗仍未关闭（不会强制恢复播放）', 'danger');
+        log('自动作答达到尝试上限，弹窗仍未关闭（不会强制恢复播放）', 'danger');
         return false;
     };
 
@@ -1417,7 +1590,7 @@
             try {
                 const ctx = resolvePopupDoc(blocked);
                 if (!ctx) {
-                    Logger.addLog('弹题窗口跨域不可访问，无法自动作答（不会强制恢复播放）', 'danger');
+                    log('弹题窗口跨域不可访问，无法自动作答（不会强制恢复播放）', 'danger');
                     return;
                 }
                 // 同一弹窗地址内换了新题 → 重置本题的尝试/判错/组合进度
@@ -1472,7 +1645,7 @@
                     this.qTextMap.delete(key);
                 }
             } catch (e) {
-                Logger.addLog('自动作答异常：' + (e && e.message || e), 'danger');
+                log('自动作答异常：' + (e && e.message || e), 'danger');
             } finally {
                 this.working = false;
                 this.lastRun = Date.now();
@@ -1483,6 +1656,56 @@
     /* ================= 播放恢复（弹题期间绝不 resume） ================= */
     const quizWaitCleanupMap = new WeakMap();
 
+    /**
+     * 真人式播放：优先点击页面上可见的播放按钮（vjs 大按钮 / 控制条），
+     * 找不到可见按钮时才降级到播放器 API（autoplay 兜底，保证进度不卡死）。
+     * 弹题 iframe 内的元素用 Human.click（坐标与光标一致）。
+     */
+    const playMediaLikeHuman = async (media, mediaWin, mediaDoc) => {
+        // 静音优先走"点音量键"真人路径：直接写 muted 属性会触发没有对应 UI 动作的
+        // volumechange 事件（部分平台播放器内部有监听），优先走真实 UI 操作
+        try {
+            const docM = mediaDoc || media.ownerDocument || document;
+            const volIcon = docM.querySelector('.volumeBox .volumeIcon, .vjs-mute-control');
+            if (volIcon && isVisible(volIcon) && !media.muted) {
+                await Human.click(volIcon);
+            } else {
+                media.muted = true;
+            }
+        } catch (e) { try { media.muted = true; } catch (_) {} }
+        // 1) 找可见的播放按钮（videojs 大按钮/控制条播放键）
+        try {
+            const doc = mediaDoc || media.ownerDocument || document;
+            const candidates = doc.querySelectorAll(
+                '.vjs-big-play-button, #playButton .bigPlayButton, .bigPlayButton.pointer, .vjs-play-control'
+            );
+            for (const b of candidates) {
+                if (isVisible(b)) {
+                    await Human.click(b);
+                    return true;
+                }
+            }
+        } catch (e) {}
+        // 2) 降级：videojs API → 原生 play()
+        try {
+            const vjs = (mediaWin && typeof mediaWin.videojs === 'function') ? mediaWin.videojs
+                : ((pageWin && typeof pageWin.videojs === 'function') ? pageWin.videojs : null);
+            if (vjs) {
+                const player = vjs('video') || vjs(media);
+                if (player && typeof player.play === 'function') {
+                    const p = player.play();
+                    if (p && typeof p.catch === 'function') p.catch(() => {});
+                    return true;
+                }
+            }
+        } catch (e) {}
+        try {
+            const p = media.play();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch (e) {}
+        return false;
+    };
+
     const stopQuizWait = (media) => {
         const cleanup = quizWaitCleanupMap.get(media);
         if (cleanup) { try { cleanup(); } catch (e) {} quizWaitCleanupMap.delete(media); }
@@ -1491,25 +1714,56 @@
     const startQuizWait = (media, mediaDoc, mediaWin) => {
         stopQuizWait(media);
         let timer = null;
+        let resumeTimer = null;
         let lastLog = 0;
-        const cleanup = () => { if (timer) clearInterval(timer); timer = null; };
+        const cleanup = () => {
+            if (timer) clearInterval(timer);
+            if (resumeTimer) clearInterval(resumeTimer);
+            timer = null;
+            resumeTimer = null;
+        };
         quizWaitCleanupMap.set(media, cleanup);
 
-        const attemptPlay = () => {
-            try {
-                media.muted = true;
-                const p = media.play();
-                if (p && typeof p.catch === 'function') p.catch(() => {});
-            } catch (e) {}
-            try {
-                if (mediaWin && mediaWin.videojs) {
-                    const player = mediaWin.videojs('video') || mediaWin.videojs(media);
-                    if (player && typeof player.play === 'function') {
-                        const p = player.play();
-                        if (p && typeof p.catch === 'function') p.catch(() => {});
+        const attemptPlay = async () => {
+            await playMediaLikeHuman(media, mediaWin, mediaDoc);
+        };
+
+        // 弹题关闭后的恢复播放必须带重试：一次 play() 可能被自动播放策略拒绝，
+        // 失败即卡死（视频永不结束 → 任务 Promise 永不 resolve → 不翻页）
+        const startResumeRetry = () => {
+            let attempts = 0;
+            resumeTimer = setInterval(() => {
+                try {
+                    if (!media || !media.isConnected) { cleanup(); return; }
+                    if (media.ended || !media.paused) {
+                        if (resumeTimer) clearInterval(resumeTimer);
+                        resumeTimer = null;
+                        return;
                     }
+                    if (findQuizOverlayInChain(mediaDoc)) {
+                        // 恢复期间又弹新题：回到弹题等待（先清掉本定时器）
+                        if (resumeTimer) clearInterval(resumeTimer);
+                        resumeTimer = null;
+                        log('恢复播放前又检测到弹题，重新进入自动作答', 'warning');
+                        startQuizWait(media, mediaDoc, mediaWin);
+                        return;
+                    }
+                    attempts++;
+                    if (attempts > 12) {
+                        if (resumeTimer) clearInterval(resumeTimer);
+                        resumeTimer = null;
+                        log('弹题后多次恢复播放失败，已交给媒体看护继续尝试（也可手动点击播放）', 'danger');
+                        return;
+                    }
+                    if (attempts <= 3 || attempts % 4 === 0) {
+                        log(`正在恢复播放（第 ${attempts} 次）...`, 'primary');
+                    }
+                    attemptPlay();
+                } catch (e) {
+                    if (resumeTimer) clearInterval(resumeTimer);
+                    resumeTimer = null;
                 }
-            } catch (e) {}
+            }, 2500);
         };
 
         const tick = () => {
@@ -1518,14 +1772,15 @@
             const blocked = findQuizOverlayInChain(mediaDoc);
             if (!blocked) {
                 cleanup();
-                Logger.addLog('弹题已完成，自动恢复播放', 'success');
+                log('弹题已完成，自动恢复播放', 'success');
                 attemptPlay();
+                startResumeRetry(); // 关键：带重试，而不是只试一次
                 return;
             }
             const now = Date.now();
             if (now - lastLog > 20000) {
                 lastLog = now;
-                Logger.addLog(`答题弹窗仍开启（${blocked.desc}），自动作答中/等待弹窗关闭，暂不恢复播放`, 'warning');
+                log(`答题弹窗仍开启（${blocked.desc}），自动作答中/等待弹窗关闭，暂不恢复播放`, 'warning');
             }
             if (!AnswerBot.working && now - AnswerBot.lastRun > 2500) {
                 AnswerBot.start(blocked);
@@ -1537,19 +1792,21 @@
     };
 
     const processMedia = (mediaType, iframeDocument, iframeWindow) => new Promise((resolve) => {
-        Logger.addLog(`正在加载 ${mediaType} 资源...`, 'primary');
+        log(`正在加载 ${mediaType} 资源...`, 'primary');
         let retryCount = 0;
         let resolved = false;
+        let watchdogRef = null;
 
         const finish = (media, msg) => {
             if (resolved) return;
             resolved = true;
+            if (watchdogRef) { clearInterval(watchdogRef); watchdogRef = null; }
             stopQuizWait(media);
-            Logger.addLog(msg || `${mediaType} 播放完毕`, 'success');
+            log(msg || `${mediaType} 播放完毕`, 'success');
             resolve();
         };
 
-        const checkAndPlay = setInterval(() => {
+        const checkAndPlay = setInterval(async () => {
             const media = iframeDocument.documentElement.querySelector(mediaType);
             if (!media) {
                 if (retryCount++ > 60) {
@@ -1559,42 +1816,29 @@
                 return;
             }
             clearInterval(checkAndPlay);
-            Logger.addLog(`${mediaType} 解析成功，开始静音播放`, 'primary');
-            media.muted = true;
+            log(`${mediaType} 解析成功，开始静音播放`, 'primary');
+            await playMediaLikeHuman(media, iframeWindow);
 
             let resumeTimer = null;
             let benignAttempts = 0;
 
             const scheduleResume = () => {
                 clearTimeout(resumeTimer);
-                resumeTimer = setTimeout(() => {
+                resumeTimer = setTimeout(async () => {
                     if (!media || media.ended || !media.paused) return;
                     const blocked = findQuizOverlayInChain(iframeDocument);
                     if (blocked) {
-                        Logger.addLog(`检测到弹题（${blocked.desc}），暂停自动恢复，转自动作答`, 'warning');
+                        log(`检测到弹题（${blocked.desc}），暂停自动恢复，转自动作答`, 'warning');
                         startQuizWait(media, iframeDocument, iframeWindow);
                         return;
                     }
                     benignAttempts++;
                     if (benignAttempts > 3) {
-                        Logger.addLog('持续恢复播放失败，请点击页面任意处（弹题等待逻辑不受影响）', 'danger');
+                        log('持续恢复播放失败，请点击页面任意处（弹题等待逻辑不受影响）', 'danger');
                         return;
                     }
-                    Logger.addLog('正在恢复播放...', 'primary');
-                    try {
-                        media.muted = true;
-                        const p = media.play();
-                        if (p && typeof p.catch === 'function') p.catch(() => {});
-                    } catch (e) {}
-                    try {
-                        if (iframeWindow && iframeWindow.videojs) {
-                            const player = iframeWindow.videojs('video') || iframeWindow.videojs(media);
-                            if (player && typeof player.play === 'function') {
-                                const p = player.play();
-                                if (p && typeof p.catch === 'function') p.catch(() => {});
-                            }
-                        }
-                    } catch (e) {}
+                    log('正在恢复播放...', 'primary');
+                    await playMediaLikeHuman(media, iframeWindow);
                 }, 3000);
             };
 
@@ -1603,11 +1847,11 @@
                 clearTimeout(resumeTimer);
                 const blocked = findQuizOverlayInChain(iframeDocument);
                 if (blocked) {
-                    Logger.addLog(`检测到弹题（${blocked.desc}），暂停自动恢复，开始自动作答`, 'warning');
+                    log(`检测到弹题（${blocked.desc}），暂停自动恢复，开始自动作答`, 'warning');
                     startQuizWait(media, iframeDocument, iframeWindow);
                     return;
                 }
-                Logger.addLog(`检测到 ${mediaType} 暂停，3秒后将自动恢复播放`, 'warning');
+                log(`检测到 ${mediaType} 暂停，3秒后将自动恢复播放`, 'warning');
                 scheduleResume();
             });
 
@@ -1619,16 +1863,36 @@
             media.addEventListener('ended', () => finish(media));
             media.onended = () => finish(media);
 
+            // 看护兜底：ended 事件可能在监听器挂上前已触发（如 AI 长等待期间视频自然放完），
+            // 或媒体节点被页面移除。轮询兜底防止 Promise 永不 resolve → 不翻页。
+            watchdogRef = setInterval(() => {
+                if (resolved) { clearInterval(watchdogRef); watchdogRef = null; return; }
+                try {
+                    if (media.ended) {
+                        clearInterval(watchdogRef); watchdogRef = null;
+                        finish(media, `${mediaType} 已结束（看护触发）`);
+                        return;
+                    }
+                    if (!media.isConnected) {
+                        clearInterval(watchdogRef); watchdogRef = null;
+                        finish(media, `${mediaType} 节点已被移除，视为任务完成`);
+                        return;
+                    }
+                    const d = media.duration;
+                    if (isFinite(d) && d > 0 && media.currentTime >= d - 1.2) {
+                        clearInterval(watchdogRef);
+                        watchdogRef = null;
+                        finish(media, `${mediaType} 已播完（进度看护触发）`);
+                    }
+                } catch (e) {}
+            }, 5000);
+
             const blockedNow = findQuizOverlayInChain(iframeDocument);
             if (blockedNow) {
-                Logger.addLog(`${mediaType} 加载完成但检测到弹题，先自动作答再播放`, 'warning');
+                log(`${mediaType} 加载完成但检测到弹题，先自动作答再播放`, 'warning');
                 startQuizWait(media, iframeDocument, iframeWindow);
             } else {
-                try {
-                    media.muted = true;
-                    const p = media.play();
-                    if (p && typeof p.catch === 'function') p.catch(() => {});
-                } catch (e) {}
+                await playMediaLikeHuman(media, iframeWindow);
                 scheduleResume(); // 若因自动播放策略未真正开始，3秒后重试
             }
         }, 1000);
@@ -1636,11 +1900,11 @@
 
     /* ================= PPT/PDF 自动翻阅 ================= */
     const processPpt = async (iframeWindow) => {
-        Logger.addLog("发现文档任务，正在自动翻阅...", "warning");
+        log("发现文档任务，正在自动翻阅...", "warning");
         try {
             const panViewIframe = iframeWindow.document.querySelector('#panView, #pdfView, #panViewFrame, .panViewFrame, iframe[src*="pan"], iframe[src*="pdf"]');
             if (!panViewIframe) {
-                Logger.addLog("未找到文档查看器，跳过该文档任务", "danger");
+                log("未找到文档查看器，跳过该文档任务", "danger");
                 return Promise.resolve();
             }
 
@@ -1688,11 +1952,113 @@
                 }
             }
             await sleep(1);
-            Logger.addLog("文档（PPT/PDF）翻阅完成", "success");
+            log("文档（PPT/PDF）翻阅完成", "success");
         } catch (e) {
-            Logger.addLog("文档任务处理异常，尝试继续下一任务", "danger");
+            log("文档任务处理异常，尝试继续下一任务", "danger");
         }
         return Promise.resolve();
+    };
+
+    /* ================= 章节任务点（作业/测验）处理 =================
+     * 需求（用户明确）：学习通章节任务点要自动作答，但**只点「保存」、绝不点「提交」**。
+     *   - 只保存 = 题目做完了但不算最终提交，学生可自己检查后再决定是否提交（更安全）
+     *   - 因此本函数对「提交/交卷」类按钮一律不动，只找「保存/暂存」按钮
+     */
+    const findSaveBtn = (doc, rootEl) => {
+        // 严格只要"保存/暂存"，绝不匹配"提交/交卷"
+        let hit = null;
+        eachDoc(doc, rootEl, (root) => {
+            if (hit) return;
+            try {
+                const cands = root.querySelectorAll('a, button, input[type="button"], .btn, .jb_btn, [class*="save" i], [id*="save" i]');
+                for (const el of cands) {
+                    if (!isVisible(el)) continue;
+                    const t = normalizeText(el.textContent || el.value || '');
+                    if (!t) continue;
+                    // 明确的排除：任何含"提交/交卷/递交/发布"的都不点
+                    if (/提交|交卷|递交|发布|上交/.test(t)) continue;
+                    if (/保存|暂存|存草稿/.test(t)) { hit = el; return; }
+                }
+            } catch (e) {}
+        });
+        return hit;
+    };
+
+    // 识别是否为作业/测验页（iframe 内出现题目容器即可判定）
+    const isHomeworkDoc = (doc) => {
+        try {
+            return !!doc.querySelector(
+                '.questionLi, .TiMu, .question-item, .exam-question, .mark_item, .ans-quest,'
+                + ' .questionTitle, .queStem, .subject_describe, .marking_title,'
+                + ' [class*="questionList" i], [class*="question-li" i], [class*="examQuestion" i]'
+            );
+        } catch (e) { return false; }
+    };
+
+    /**
+     * 处理一个作业/测验任务点：逐题作答 → 只点保存。
+     * 返回 true 表示处理过（无论成功与否），false 表示当前 iframe 不是作业页。
+     */
+    const processHomework = async (doc, win) => {
+        if (!isHomeworkDoc(doc)) return false;
+        log("发现章节任务点（作业/测验），开始自动作答（仅保存，不提交）", "warning");
+
+        // 收集题目：优先常见题目容器，退化到逐一枚举选项组
+        let questions = [];
+        try {
+            questions = Array.from(doc.querySelectorAll(
+                '.questionLi, .TiMu, .question-item, .exam-question, .mark_item, .ans-quest,'
+                + ' [class*="questionList" i] > li, [class*="question-li" i]'
+            )).filter(isVisible);
+        } catch (e) {}
+
+        let answered = 0;
+        if (questions.length) {
+            for (const q of questions) {
+                try {
+                    const qText = getQuestionText(findQuestionEl(doc, q));
+                    const options = collectOptions(doc, q);
+                    const blanks = [];
+                    try { blanks.push(...Array.from(q.querySelectorAll('input[type="text"], textarea')).filter(isVisible)); } catch (e) {}
+
+                    let picks = [];
+                    const local = localConfiguredAnswer(qText, options);
+                    if (local && local.length) picks = options.filter(o => local.some(a => matchAnswer(o, a)));
+                    if (!picks.length && Settings.aiEnabled && options.length) {
+                        const ans = await aiAnswer(qText, options);
+                        if (ans && ans.length) picks = options.filter(o => ans.some(a => matchAnswer(o, a)));
+                    }
+                    if (picks.length) {
+                        for (const p of picks) { await Human.click(p.el); await Human.pause(); }
+                        answered++;
+                    } else if (blanks.length) {
+                        // 填空：无法确定答案时留空（不猜，避免乱填触发异常）
+                    }
+                    await sleep(randInt(8, 18) / 10);   // 真人节奏：题间 0.8~1.8s
+                } catch (e) {}
+            }
+        } else {
+            // 未识别到题目容器：退化处理——把可见的选项组各选第一个"能匹配的答案"
+            try {
+                const optionEls = Array.from(doc.querySelectorAll('.ans-videoquiz-opt, label, [class*="option" i]')).filter(isVisible);
+                if (!optionEls.length) {
+                    log("任务点页未发现可作答内容，仅执行保存", "warning");
+                }
+            } catch (e) {}
+        }
+
+        log(`任务点作答完成（作答 ${answered} 题），准备保存（不会点提交）`, answered ? "success" : "warning");
+
+        // 只保存，绝不提交
+        const saveBtn = findSaveBtn(doc, doc.body);
+        if (!saveBtn) {
+            log("未找到「保存」按钮（已跳过提交，绝不自动交卷）", "warning");
+            return true;
+        }
+        await Human.click(saveBtn);
+        await sleep(randInt(20, 40) / 10);
+        log("已点击保存（未提交，可自行检查后手动交卷）", "success");
+        return true;
     };
 
     /* ================= 任务调度 ================= */
@@ -1706,18 +2072,19 @@
         return all;
     };
 
-    const goToNextChapter = () => {
+    const goToNextChapter = async () => {
         if (!Settings.cx) return;
+        if (!Logger) Logger = ensureLogger();   // 防 Logger 未初始化时崩溃
         const nextBtnStatus = document.querySelector("#prevNextFocusNext");
         if (!nextBtnStatus || nextBtnStatus.style.display === "none") {
-            Logger.addLog("已经到达最后一章节，无法跳转", "danger");
+            log("已经到达最后一章节，无法跳转", "danger");
         } else {
             const nextClickBtn = document.querySelector(".jb_btn.jb_btn_92.fr.fs14.nextChapter");
             if (nextClickBtn) {
-                Logger.addLog("正前往下一章节...", "success");
-                nextClickBtn.click();
+                log("正前往下一章节...", "success");
+                await Human.click(nextClickBtn);   // 真人点击（原来直接 .click()，漏走拟人层）
             } else {
-                Logger.addLog("未找到下一章按钮元素，自动跳转失败", "danger");
+                log("未找到下一章按钮元素，自动跳转失败", "danger");
             }
         }
     };
@@ -1766,12 +2133,16 @@
                     } else if (win.document.querySelector("#panView, #pdfView, #panViewFrame, .panViewFrame, iframe[src*='pan'], iframe[src*='pdf']")) {
                         processedIframes.add(iframe);
                         taskPromises.push(processPpt(win));
+                    } else if (Settings.answerTask && isHomeworkDoc(doc)) {
+                        // 章节任务点（作业/测验）：面板「任务点题目」开关打开时才处理；只保存不提交
+                        processedIframes.add(iframe);
+                        taskPromises.push(processHomework(doc, win));
                     }
                 } catch (e) {}
             }
 
             if (taskPromises.length > 0) {
-                Logger.addLog(`精准识别到 ${taskPromises.length} 个未完成多媒体任务，开始处理...`, "warning");
+                log(`精准识别到 ${taskPromises.length} 个未完成多媒体任务，开始处理...`, "warning");
                 await Promise.all(taskPromises);
             }
 
@@ -1779,26 +2150,45 @@
 
             // 跳转前等待弹题完全关闭（自动作答进行中）
             if (isAnyQuizBlocked()) {
-                Logger.addLog("存在未完成的答题弹窗，等待自动作答完成后跳转...", "warning");
+                log("存在未完成的答题弹窗，等待自动作答完成后跳转...", "warning");
                 let lastLog = 0;
                 while (thisTaskId === currentTaskId && Settings.cx && isAnyQuizBlocked()) {
                     await sleep(1);
                     const now = Date.now();
                     if (now - lastLog > 20000) {
                         lastLog = now;
-                        Logger.addLog("仍在等待答题弹窗关闭（不会绕过）...", "warning");
+                        log("仍在等待答题弹窗关闭（不会绕过）...", "warning");
                     }
                 }
             }
 
             if (thisTaskId !== currentTaskId) return;
 
-            Logger.addLog("已知多媒体任务处理完毕，跳过章节习题，前往下一节", "success");
+            log("已知多媒体任务处理完毕，跳过章节习题，前往下一节", "success");
             await sleep(3);
-            if (thisTaskId === currentTaskId && !isAnyQuizBlocked()) {
-                goToNextChapter();
+            // sleep 期间又弹新题：不要直接放弃，重新进入弹题等待，弹窗关闭后再跳转
+            if (thisTaskId === currentTaskId && isAnyQuizBlocked()) {
+                log("跳转前检测到新弹题，先完成作答再跳转（不会绕过）", "warning");
+                let lastLog = 0;
+                while (thisTaskId === currentTaskId && Settings.cx && isAnyQuizBlocked()) {
+                    await sleep(1);
+                    const now = Date.now();
+                    if (now - lastLog > 20000) {
+                        lastLog = now;
+                        log("仍在等待新弹题关闭（不会绕过）...", "warning");
+                    }
+                }
+            }
+            if (thisTaskId !== currentTaskId) return;
+            if (!isAnyQuizBlocked()) {
+                await goToNextChapter();   // async（内部走 Human 真人点击）
             } else {
-                Logger.addLog("跳转已取消（页面切换或弹窗未完成）", "danger");
+                log("跳转已取消（页面切换或弹窗未完成）", "danger");
+                // 页面没切走但弹窗还在 → 3 秒后重新调度任务，避免无人翻页
+                if (thisTaskId === currentTaskId) {
+                    isProcessing = false;
+                    setTimeout(processIframeTask, 3000);
+                }
             }
         } finally {
             if (thisTaskId === currentTaskId) isProcessing = false;
@@ -1819,7 +2209,7 @@
 
         cxStarted = true;
         Logger = ensureLogger();
-        Logger.addLog("超星引擎已就绪（面板可开关）", "success");
+        log("超星引擎已就绪（面板可开关）", "success");
 
         let lastUrl = url;
         let lastIframeSrc = '';
@@ -1832,7 +2222,7 @@
             lastUrl = window.location.href;
             const iframe = document.getElementById('iframe');
             lastIframeSrc = iframe ? (iframe.getAttribute('src') || '') : '';
-            Logger.addLog(reason, "primary");
+            log(reason, "primary");
             isProcessing = false;
             currentTaskId++;
             setTimeout(processIframeTask, 3000);
@@ -1897,7 +2287,7 @@
             if (!Logger) Logger = ensureLogger();
             if (!this.readyLogged) {
                 this.readyLogged = true;
-                Logger.addLog('优学院引擎已就绪：仅前6专题、1倍速不拖进度、不做题、挂机防检测', 'success');
+                log('优学院引擎已就绪：仅前6专题、1倍速不拖进度、不做题、挂机防检测', 'success');
             }
             if (this.busy) return;
             this.busy = true;
@@ -1916,7 +2306,7 @@
                 if (chapterIdx >= maxCh) {
                     if (!this.stopLogged) {
                         this.stopLogged = true;
-                        Logger.addLog(`已到达第 ${maxCh} 个专题边界，停止自动学习（防反作弊；可在面板关闭“前6专题”限制）`, 'danger');
+                        log(`已到达第 ${maxCh} 个专题边界，停止自动学习（防反作弊；可在面板关闭“前6专题”限制）`, 'danger');
                     }
                     return;
                 }
@@ -1942,7 +2332,7 @@
                     if (Settings.answerTask) {
                         await this.answerTaskPage(active);
                     }
-                    Logger.addLog('优学院：非课件页（练习/作业），短暂停留后跳过' + (Settings.answerTask ? '（已尝试任务点作答）' : '，不做题'), 'warning');
+                    log('优学院：非课件页（练习/作业），短暂停留后跳过' + (Settings.answerTask ? '（已尝试任务点作答）' : '，不做题'), 'warning');
                     await sleep(randInt(20, 40) / 10);
                     await this.nextPage(active, chapters);
                 }
@@ -1961,9 +2351,8 @@
 
             const media = this.findMedia();
             if (media) {
-                Logger.addLog('优学院课件：开始播放（静音、正常速度、不拖进度条）', 'primary');
-                try { media.muted = true; } catch (e) {}
-                this.tryPlay(media);
+                log('优学院课件：开始播放（正常速度、不拖进度条）', 'primary');
+                this.tryPlay(media); // 真人式：优先点可见播放控件，失败才 API 兜底
 
                 const started = Date.now();
                 let lastRecover = 0;
@@ -1999,7 +2388,7 @@
                             // 题目/作业弹窗：不做题；等待 30 秒后选择离开跳过该页
                             if (!this.modalWaitStart) this.modalWaitStart = Date.now();
                             if (Date.now() - this.modalWaitStart > 30000) {
-                                Logger.addLog('优学院：课件内题目弹窗（不做题），选择“确定离开”跳过该页', 'warning');
+                                log('优学院：课件内题目弹窗（不做题），选择“确定离开”跳过该页', 'warning');
                                 await this.handleModal();
                                 return false; // 弹窗的“确定离开”已触发切换，不再额外翻页
                             }
@@ -2021,7 +2410,7 @@
             }
 
             // 文档/图文课件：拟人停留 4~8 秒后翻页
-            Logger.addLog('优学院文档/图文页：拟人停留后翻页', 'warning');
+            log('优学院文档/图文页：拟人停留后翻页', 'warning');
             await sleep(randInt(40, 80) / 10);
             return true;
         },
@@ -2047,13 +2436,22 @@
             return null;
         },
 
-        tryPlay(media) {
+        async tryPlay(media) {
+            // 真人式：优先点页面可见的播放控件，失败才降级 API
+            try {
+                const candidates = document.querySelectorAll(
+                    '.mejs__play > button, .mejs__overlay-play, .jw-icon-display, .vjs-big-play-button'
+                );
+                for (const btn of candidates) {
+                    if (isVisible(btn)) {
+                        await Human.click(btn);
+                        return;
+                    }
+                }
+            } catch (e) {}
             try {
                 const p = media.play();
-                if (p && typeof p.catch === 'function') p.catch(() => {
-                    const btn = document.querySelector('.mejs__play > button, .mejs__overlay-play, .jw-icon-display, .vjs-big-play-button');
-                    if (btn) clickEl(btn);
-                });
+                if (p && typeof p.catch === 'function') p.catch(() => {});
             } catch (e) {}
         },
 
@@ -2088,7 +2486,7 @@
             if (/上限|已达上限|今日学习时长|今日任务点|无法完成任务点/.test(text)) {
                 this.dayLimitHit = true;
                 this.lastModalKey = key;
-                Logger.addLog('优学院：今日学习时长/任务点已达上限，停止自动学习（防反作弊）', 'danger');
+                log('优学院：今日学习时长/任务点已达上限，停止自动学习（防反作弊）', 'danger');
                 return;
             }
 
@@ -2106,26 +2504,22 @@
             else target = pick(['知道了', '确定', '继续']);
             this.lastModalKey = key;
             if (target) {
-                Logger.addLog(`优学院弹窗处理：${normalizeText(target.textContent).slice(0, 12)}`, 'warning');
-                clickEl(target);
+                log(`优学院弹窗处理：${normalizeText(target.textContent).slice(0, 12)}`, 'warning');
+                await Human.click(target); // 真人点击（坐标一致 + 轨迹）
                 await sleep(randInt(10, 20) / 10);
             }
         },
 
-        // 挂机检测防御：随机 25~45 秒在页面内模拟一次鼠标移动（比参考脚本每秒一次的机械方案更拟人）
+        // 挂机检测防御：随机 25~45 秒沿曲线移动一次鼠标（真人轨迹，不是瞬移单点）
         startKeepAlive() {
             if (this.keepAliveTimer) return;
             const loop = () => {
-                this.keepAliveTimer = setTimeout(() => {
+                this.keepAliveTimer = setTimeout(async () => {
                     try {
                         if (Settings.yxy && !this.dayLimitHit) {
-                            document.dispatchEvent(new MouseEvent('mousemove', {
-                                bubbles: true,
-                                cancelable: true,
-                                view: window,
-                                clientX: randInt(40, Math.max(80, window.innerWidth - 40)),
-                                clientY: randInt(40, Math.max(80, window.innerHeight - 40))
-                            }));
+                            const tx = randInt(60, Math.max(120, (window.innerWidth || 1280) - 60));
+                            const ty = randInt(60, Math.max(120, (window.innerHeight || 800) - 60));
+                            await Human.move(tx, ty);
                         }
                     } catch (e) {}
                     loop();
@@ -2138,7 +2532,7 @@
         // 优学院题目元素较杂，这里做保守的通用处理：AI 优先，命中后点击选项并提交。
         async answerTaskPage(active) {
             try {
-                Logger.addLog('任务点题目自动作答：识别题目中...', 'warning');
+                log('任务点题目自动作答：识别题目中...', 'warning');
                 // 等待题目渲染
                 for (let i = 0; i < 20; i++) {
                     if (document.querySelector('.question-wrapper, .question-container, .ans-videoquiz, .topic-option-item, .el-radio, .el-checkbox')) break;
@@ -2148,7 +2542,7 @@
                     '.question-wrapper .option, .question-container .option, .topic-option-item, .el-radio, .el-checkbox'
                 )).filter(isVisible);
                 if (!optEls.length) {
-                    Logger.addLog('任务点未发现可作答选项（可能不在题目页或结构不支持）', 'warning');
+                    log('任务点未发现可作答选项（可能不在题目页或结构不支持）', 'warning');
                     return;
                 }
                 const options = optEls.map(el => ({ el: el.closest('label, .option, .el-radio, .el-checkbox') || el, text: normalizeText(el.textContent) })).filter(o => o.text);
@@ -2164,26 +2558,27 @@
                     if (ans && ans.length) picks = options.filter(o => ans.some(a => matchAnswer(o, a)));
                 }
                 if (!picks.length) {
-                    Logger.addLog('任务点：无 AI 命中，跳过作答（不猜答案，避免风控）', 'warning');
+                    log('任务点：无 AI 命中，跳过作答（不猜答案，避免风控）', 'warning');
                     return;
                 }
                 for (const p of picks) {
-                    await sleep(randInt(20, 40) / 10);
-                    clickEl(p.el);
+                    await sleep(randInt(12, 26) / 10); // 读选项
+                    await Human.click(p.el);
                 }
                 await sleep(randInt(15, 30) / 10);
                 const submit = Array.from(document.querySelectorAll('button, .btn, .el-button'))
                     .find(b => isVisible(b) && /提交|交卷|保存|确定/.test(b.textContent || ''));
                 if (submit) {
-                    clickEl(submit);
-                    Logger.addLog('任务点题目已提交', 'success');
+                    await Human.click(submit);
+                    log('任务点题目已提交', 'success');
                 }
             } catch (e) {
-                Logger.addLog('任务点作答异常：' + ((e && e.message) || e), 'danger');
+                log('任务点作答异常：' + ((e && e.message) || e), 'danger');
             }
         },
 
         async nextPage(active, chapters) {
+            if (!chapters) chapters = [];   // 防 chapters 为 null 时 indexOf 崩溃
             const maxCh = Settings.limit6 ? this.MAX_CHAPTERS : Infinity;
             const pages = Array.from(document.querySelectorAll('.catalog-list .page-name'));
             const idx = pages.indexOf(active);
@@ -2193,7 +2588,7 @@
                 if (nextChIdx >= maxCh) {
                     if (!this.stopLogged) {
                         this.stopLogged = true;
-                        Logger.addLog(`下一页属于第 ${nextChIdx + 1} 个专题，超出前 ${maxCh} 个专题限制，停止（防反作弊）`, 'danger');
+                        log(`下一页属于第 ${nextChIdx + 1} 个专题，超出前 ${maxCh} 个专题限制，停止（防反作弊）`, 'danger');
                     }
                     return;
                 }
@@ -2203,7 +2598,7 @@
                 if (stat && stat.classList.contains('chapter-stat') && this.lastChapterIdx >= maxCh - 1) {
                     if (!this.stopLogged) {
                         this.stopLogged = true;
-                        Logger.addLog(`已完成第 ${maxCh} 个专题，停止自动学习（防反作弊）`, 'success');
+                        log(`已完成第 ${maxCh} 个专题，停止自动学习（防反作弊）`, 'success');
                     }
                     return;
                 }
@@ -2215,8 +2610,8 @@
             if (!btn) return;
             await sleep(randInt(15, 35) / 10); // 1.5~3.5 秒拟人停顿
             const name = normalizeText(btn.textContent).slice(0, 20);
-            Logger.addLog(`优学院翻页 → ${name || '下一页'}`, 'primary');
-            clickEl(btn);
+            log(`优学院翻页 → ${name || '下一页'}`, 'primary');
+            await Human.click(btn);
             await sleep(randInt(15, 30) / 10);
         },
 
@@ -2230,7 +2625,7 @@
             if (isChapterStat && this.lastChapterIdx >= maxCh - 1) {
                 if (!this.stopLogged) {
                     this.stopLogged = true;
-                    Logger.addLog(`已完成第 ${maxCh} 个专题，停止自动学习（防反作弊）`, 'success');
+                    log(`已完成第 ${maxCh} 个专题，停止自动学习（防反作弊）`, 'success');
                 }
                 return;
             }
@@ -2239,445 +2634,14 @@
             if (!unfinishedInLimit) {
                 if (!this.stopLogged) {
                     this.stopLogged = true;
-                    Logger.addLog('前 6 个专题内已无未完成课件，停止（防反作弊）', 'success');
+                    log('前 6 个专题内已无未完成课件，停止（防反作弊）', 'success');
                 }
                 return;
             }
             await sleep(randInt(20, 40) / 10);
-            Logger.addLog('优学院统计页：前往下一节', 'primary');
-            clickEl(btn);
+            log('优学院统计页：前往下一节', 'primary');
+            await Human.click(btn);
             await sleep(randInt(15, 30) / 10);
-        }
-    };
-
-    /* ================= 知到(智慧树)引擎 =================
-     * 反作弊要点（已确认）：
-     *  - 页面 Object.freeze 冻结了 RegExp.test / Function.toString，禁止任何篡改原生方法；
-     *  - 平台有"异常学习行为"检测，会锁定整门课程（dialog-aberrant）；
-     *  - 弹题"未做答不能关闭"，必须真实作答；
-     *  - 进度条 progressBall 不可拖拽，必须真实播放；
-     *  - 有学习习惯分，禁止一次刷完所有课程。
-     * 策略：只做"拟人化"操作——真实播放、随机停顿、单页面顺序、不加速不跳进度、不碰原生方法。
-     */
-    const ZHS = {
-        busy: false,
-        stopLogged: false,
-        lastDialogKey: '',
-        answering: false,
-        planMap: null,
-        keepAliveTimer: null,
-        readyLogged: false,
-        lockLogged: false,
-        answeredCount: 0,
-
-        // 课程被锁定的提示检测（出现即停止一切操作）
-        isCourseLocked() {
-            try {
-                const aberrant = document.querySelector('.dialog-aberrant, .dialog .aberrant');
-                if (aberrant && isVisible(aberrant)) return true;
-                const t = document.body ? (document.body.innerText || '') : '';
-                if (/平台监测到你存在异常学习行为|课程锁定|不再允许学习/.test(t)) return true;
-            } catch (e) {}
-            return false;
-        },
-
-        // 检测弹题（知到新版弹题运行时动态插入：.question-container/.answer-container；
-        // 旧版为 .dialog-test 对话框或 iframe#tmDialog_iframe）
-        findQuizDialog() {
-            try {
-                // 新版：题目卡片容器（CSS 中确认存在的真实类名）
-                const newBox = document.querySelector('.question-container, .answer-container, .question');
-                if (newBox && isVisible(newBox) && newBox.querySelector('.options .option, .option')) return newBox;
-
-                // 旧版：Element UI 对话框
-                const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper.dialog-test, .dialog-test'));
-                for (const d of dialogs) {
-                    if (isVisible(d)) return d;
-                }
-
-                // 旧版：iframe#tmDialog_iframe
-                const ifr = document.getElementById('tmDialog_iframe');
-                if (ifr && ifr.contentDocument) {
-                    const w = ifr.contentDocument.querySelector('.answerOption label, .option');
-                    if (w) return ifr.contentDocument.body;
-                }
-            } catch (e) {}
-            return null;
-        },
-
-        // 从可用 DOM 中收集题目与选项（覆盖新版 .question-container/.options .option 与旧版结构）
-        collectQuiz(dialog) {
-            const doc = dialog.ownerDocument || document;
-            let root = dialog;
-            let optEls = [];
-            let qEl = null;
-            const OPT_SEL = [
-                '.question-container .options .option',
-                '.options .option',
-                '.topic-list .topic-option-item',
-                '.topic-option-item',
-                '.answerOption label',
-                '.option'
-            ].join(',');
-            const tryRoot = (r) => {
-                if (!r || !r.querySelectorAll) return false;
-                const opts = Array.from(r.querySelectorAll(OPT_SEL)).filter(isVisible);
-                if (opts.length) {
-                    optEls = opts;
-                    qEl = r.querySelector('.question-container .title, .title-tit, .topic-title, .question-title, .question-content, h3, .el-dialog__title') || qEl;
-                    return true;
-                }
-                try {
-                    for (const f of r.querySelectorAll('iframe')) {
-                        if (f.contentDocument && tryRoot(f.contentDocument.body)) return true;
-                    }
-                } catch (e) {}
-                return false;
-            };
-            tryRoot(root);
-            // 兼容旧版 #tmDialog_iframe
-            if (!optEls.length) {
-                try {
-                    const ifr = document.getElementById('tmDialog_iframe');
-                    if (ifr && ifr.contentDocument) tryRoot(ifr.contentDocument.body);
-                } catch (e) {}
-            }
-            const qText = normalizeText((qEl && qEl.textContent) || '');
-            const options = optEls.map(el => ({ el, text: normalizeText(el.textContent) })).filter(o => o.text);
-            const typeText = (qEl && qEl.textContent) || '';
-            // 题型：题干标注 > input 类型 > 选项数量推断
-            const hasCheckbox = optEls.some(el => el.querySelector && el.querySelector('input[type="checkbox"]'));
-            const isMulti = /多选题|多选|多项/.test(typeText) || hasCheckbox;
-            const isJudge = /判断题|判断/.test(typeText) ||
-                (options.length === 2 && options.every(o => /^(对|错|正确|错误|是|否|√|×|T|F)$/i.test(o.text)));
-            return { doc, root, qText, options, isMulti, isJudge };
-        },
-
-        // 未作答判定：知到提示“未做答的弹题不能关闭”，据此确认弹题仍待处理
-        isUnansweredQuiz() {
-            try {
-                const boxes = Array.from(document.querySelectorAll('.el-message-box__wrapper, .el-message-box'));
-                return boxes.some(b => isVisible(b) && /未做答的弹题不能关闭|未作答/.test(b.textContent || ''));
-            } catch (e) {}
-            return false;
-        },
-
-        async tick() {
-            if (!Settings.zhs) return;
-            if (!document.querySelector('.videoArea, #vjs_container, #nextBtn, ul.list li.video')) return;
-            if (!Logger) Logger = ensureLogger();
-            if (!this.readyLogged) {
-                this.readyLogged = true;
-                Logger.addLog('知到(智慧树)引擎已就绪：真实播放/不加速/不拖进度/拟人操作', 'success');
-            }
-            if (this.isCourseLocked()) {
-                if (!this.lockLogged) {
-                    this.lockLogged = true;
-                    Logger.addLog('检测到平台"异常行为"锁定提示，已立即停止全部操作（请手动查看异常记录）', 'danger');
-                }
-                return;
-            }
-            if (this.busy) return;
-            this.busy = true;
-            try {
-                // 1) 弹题优先（中间弹题）
-                const dialog = this.findQuizDialog();
-                if (dialog) {
-                    if (Settings.answerPop) {
-                        // 每轮只答一次，后续轮次由 tick 继续推进（轮间天然有 1.5s+ 间隔，避免高频提交）
-                        await this.answerQuiz(dialog);
-                    } else if (!this.warnedPopOff) {
-                        this.warnedPopOff = true;
-                        Logger.addLog('检测到弹题，但"课程中间弹题"开关已关闭（未做答不能关闭，请手动处理）', 'warning');
-                    }
-                    if (this.isCourseLocked()) return;
-                    // 有弹题时不再推进播放/翻页，等待本题处理完
-                    return;
-                } else {
-                    this.warnedPopOff = false;
-                }
-
-                // 2) 播放控制：真实播放、保持不暂停
-                const media = document.getElementById('vjs_container_html5_api') ||
-                    document.querySelector('.videoArea video, video');
-                const bigPlay = document.querySelector('#playButton .bigPlayButton, .bigPlayButton.pointer, .vjs-big-play-button');
-                if (media) {
-                    if (bigPlay && isVisible(bigPlay)) {
-                        clickEl(bigPlay); // 拟人点击播放按钮
-                    } else if (media.paused && !media.ended) {
-                        try { media.play && media.play().catch(() => {}); } catch (e) {}
-                    }
-                }
-
-                // 3) 本节完成 → 下一节（真实进度到达，不拖拽）
-                if (this.isLessonFinished(media)) {
-                    await this.nextLesson();
-                }
-            } catch (e) {
-            } finally {
-                this.busy = false;
-            }
-        },
-
-        isLessonFinished(media) {
-            try {
-                if (media && media.duration && media.currentTime >= media.duration - 1) return true;
-                const pass = document.querySelector('.progress .passTime');
-                const passWidth = pass ? parseFloat(pass.style.width || '0') : 0;
-                // 智慧树进度条为百分比数值
-                if (passWidth >= 98) return true;
-                const txt = pass ? (pass.style.width || '') : '';
-                if (/9[89](\.\d+)?%/.test(txt)) return true;
-            } catch (e) {}
-            return false;
-        },
-
-        async nextLesson() {
-            if (!Settings.zhs) return;
-            if (this.isCourseLocked()) return;
-            const btn = document.getElementById('nextBtn');
-            if (!btn) {
-                if (!this.stopLogged) {
-                    this.stopLogged = true;
-                    Logger.addLog('已到最后一节（无下一节按钮），停止。建议分多天学习以保留学习习惯分', 'success');
-                }
-                return;
-            }
-            await sleep(this.realDelay() / 1000);
-            Logger.addLog('本节播放完成，前往下一节', 'primary');
-            clickEl(btn);
-            await sleep(randInt(25, 45) / 10);
-        },
-
-        /**
-         * 组合枚举：返回按规模递增的组合序列（1项 → 2项 → 3项 → …），
-         * 用于多选题的分层遍历；上限 comboCap 防止组合爆炸。
-         */
-        buildCombos(optionsLen, comboCap) {
-            const idx = Array.from({ length: optionsLen }, (_, i) => i);
-            const combos = [];
-            const pick = (start, cur) => {
-                if (cur.length) combos.push(cur.slice());
-                if (cur.length >= optionsLen) return;
-                for (let i = start; i < idx.length; i++) {
-                    cur.push(idx[i]);
-                    pick(i + 1, cur);
-                    cur.pop();
-                }
-            };
-            pick(0, []);
-            combos.sort((a, b) => a.length - b.length);
-            return combos.slice(0, comboCap);
-        },
-
-        /**
-         * 某题的遍历计划（关闭 AI 时的兜底，也用于 AI 未命中后的重试）。
-         * - 单选/判断：每个选项各试一次（n 种）
-         * - 多选：按 1项→2项→…→全选 分层遍历（受 comboCap 限制）
-         * 计划缓存在 this.planMap[qKey]，跨轮次续走、不重复提交。
-         */
-        getQuizPlan(info, qKey) {
-            if (!this.planMap) this.planMap = new Map();
-            let plan = this.planMap.get(qKey);
-            if (plan) return plan;
-            const n = info.options.length;
-            const comboCap = 16; // 单题最多尝试 16 种组合，避免高频提交被风控
-            const combos = info.isMulti
-                ? this.buildCombos(n, comboCap)
-                : Array.from({ length: n }, (_, i) => [i]);
-            plan = { combos, cursor: 0, fails: 0, done: false };
-            this.planMap.set(qKey, plan);
-            // 控制缓存规模
-            if (this.planMap.size > 20) {
-                const firstKey = this.planMap.keys().next().value;
-                this.planMap.delete(firstKey);
-            }
-            return plan;
-        },
-
-        // 拟人勾选：先清空已选项，再点目标选项
-        async selectOptions(info, picks) {
-            try {
-                info.root.querySelectorAll(
-                    '.options .option.active, .options .option.selected, .topic-option-item.active, .option.selected, [class*="selected"]'
-                ).forEach(el => clickEl(el));
-            } catch (e) {}
-            for (const p of picks) {
-                await sleep(randInt(15, 35) / 10);
-                clickEl(p.el);
-            }
-            await sleep(this.realDelay() / 1000);
-        },
-
-        // 弹题作答：优先 AI；AI 关闭/未命中 → 分层遍历兜底（可完整遍历，逐轮推进不重复）
-        // 注意：同一题的后续轮次由 tick 反复调用本函数推进，因此不能用题目 key 做防并发，
-        //       必须用「本轮是否仍在执行」布尔标志（answering）。
-        async answerQuiz(dialog) {
-            if (this.answering) return; // 上一轮尚未结束
-            const info = this.collectQuiz(dialog);
-            if (!info.options.length) return;
-            this.answering = true;
-            const qKey = this.qKeyOf(info);
-            try {
-                this.answeredCount++;
-                const typeName = info.isMulti ? '多选' : info.isJudge ? '判断' : '单选';
-                Logger.addLog(`知到弹题(${typeName})：${info.qText.slice(0, 40) || '(未识别题干)'}`, 'warning');
-
-                // 本地配置答案（瞬时）优先；开启 AI 时禁用排除法：只等 AI，不用猜测答案。
-                let picks = null;
-                let viaAI = false;
-                let aiUnavailable = false;
-                const local = localConfiguredAnswer(info.qText, info.options);
-                if (local && local.length) {
-                    const hit = info.options.filter(o => local.some(a => matchAnswer(o, a)));
-                    if (hit.length) picks = hit;
-                }
-                if (!picks && Settings.aiEnabled) {
-                    if (!this.aiByKey) this.aiByKey = new Map();
-                    let rec = this.aiByKey.get(qKey);
-                    if (!rec) {
-                        rec = { answer: null, promise: null, tried: false, settled: false };
-                        rec.promise = aiAnswer(info.qText, info.options)
-                            .then(ans => { rec.answer = ans || null; rec.settled = true; return ans; })
-                            .catch(() => { rec.answer = null; rec.settled = true; return null; });
-                        this.aiByKey.set(qKey, rec);
-                        if (this.aiByKey.size > 20) this.aiByKey.delete(this.aiByKey.keys().next().value);
-                    }
-                    if (!rec.tried) {
-                        if (!rec.answer && rec.promise) {
-                            const waitLog = setInterval(() => {
-                                if (rec.answer || rec.settled) { clearInterval(waitLog); return; }
-                                Logger.addLog('AI 思考中，保持等待（已禁用排除法）', 'primary');
-                            }, 15000);
-                            try { await rec.promise; } finally { clearInterval(waitLog); }
-                        }
-                        if (rec.answer && rec.answer.length) {
-                            rec.tried = true;
-                            const hit = info.options.filter(o => rec.answer.some(a => matchAnswer(o, a)));
-                            if (hit.length) { picks = hit; viaAI = true; }
-                            else { Logger.addLog('AI 答案无法匹配选项，改用遍历兜底', 'warning'); aiUnavailable = true; }
-                        } else {
-                            if (!rec.warned) {
-                                rec.warned = true;
-                                const wait = aiBlocked.until > Date.now()
-                                    ? `（AI 熔断中：${aiBlocked.reason || 'Key/账户不可用'}）` : '';
-                                Logger.addLog(`知到：AI 未返回可用答案，改用遍历兜底${wait}`, 'warning');
-                            }
-                            aiUnavailable = true; // AI 明确不可用 → 才允许遍历
-                        }
-                    } else {
-                        // 本题 AI 已答过且提交未通过 → AI 也拿不准，禁用遍历猜答案，停等人工
-                        if (!rec.warnedFail) {
-                            rec.warnedFail = true;
-                            Logger.addLog('AI 作答未通过，已禁用排除法（避免反复试错触发风控，请人工处理）', 'danger');
-                        }
-                        return;
-                    }
-                }
-                if (viaAI) Logger.addLog(`弹题 AI 命中：${picks.map(p => p.text).join('、')}`, 'success');
-
-                // 遍历只在「未开启AI」或「AI 明确不可用」时使用；AI 开启且可用时绝不猜答案
-                if (!picks) {
-                    if (Settings.aiEnabled && !aiUnavailable) {
-                        Logger.addLog('AI 尚未给出答案，保持等待（已禁用排除法，不会用猜测答案顶替）', 'warning');
-                        return;
-                    }
-                    const plan = this.getQuizPlan(info, qKey);
-                    if (plan.done || plan.cursor >= plan.combos.length) {
-                        if (!plan.done) {
-                            plan.done = true;
-                            Logger.addLog(`知到弹题遍历已穷尽（${plan.combos.length} 种组合），停止自动作答，请手动完成`, 'danger');
-                        }
-                        return;
-                    }
-                    const combo = plan.combos[plan.cursor];
-                    plan.cursor++;
-                    picks = combo.map(i => info.options[i]).filter(Boolean);
-                    Logger.addLog(`弹题遍历 ${plan.cursor}/${plan.combos.length}：${picks.map(p => p.text).join('、')}`, 'primary');
-                }
-
-                await this.selectOptions(info, picks);
-
-                // 提交（提交后才会判定/关闭；按钮可能在弹窗 footer 或 iframe 内）
-                const submit = this.findSubmitBtn(info);
-                if (!submit) {
-                    Logger.addLog('未找到知到弹题提交按钮，保持等待（不强行关闭）', 'warning');
-                    return;
-                }
-                clickEl(submit);
-                await sleep(randInt(30, 55) / 10); // 提交后等判定，拟人
-
-                // 判定结果
-                if (this.findQuizDialog()) {
-                    // 仍在 → 视为答错
-                    const plan = this.getQuizPlan(info, qKey);
-                    plan.fails++;
-                    if (viaAI) {
-                        plan.cursor = 0; // AI 错了 → 交给遍历完整走一遍
-                        Logger.addLog('AI 答案未通过，下一轮改用遍历兜底', 'warning');
-                    } else {
-                        Logger.addLog(`第 ${plan.cursor}/${plan.combos.length} 轮未通过，继续遍历下一种组合`, 'warning');
-                    }
-                    if (plan.cursor >= plan.combos.length) {
-                        plan.done = true;
-                        Logger.addLog('知到弹题遍历已穷尽，停止自动作答（请手动完成）', 'danger');
-                    }
-                } else {
-                    Logger.addLog('弹题完成，弹窗已关闭', 'success');
-                    if (this.planMap) this.planMap.delete(qKey);
-                    this.lastDialogKey = '';
-                }
-            } finally {
-                this.answering = false;
-            }
-        },
-
-        qKeyOf(info) {
-            return (info.qText || '') + '|' + info.options.map(o => o.text).join('|');
-        },
-
-        findSubmitBtn(info) {
-            const texts = ['提交', '确定', '确认', '下一题', '提交答案'];
-            const scan = (root) => {
-                if (!root) return null;
-                try {
-                    const btns = Array.from(root.querySelectorAll('.el-dialog__footer button, .dialog-footer button, .dialog-footer .btn, button.btn, .el-button, button'));
-                    return btns.find(b => isVisible(b) && texts.some(t => (b.textContent || '').indexOf(t) !== -1)) || null;
-                } catch (e) { return null; }
-            };
-            let btn = scan(info.root);
-            if (btn) return btn;
-            // 兼容：兄弟节点中的 dialog footer，或 iframe 内
-            try {
-                btn = scan(document.querySelector('.el-dialog__wrapper.dialog-test .el-dialog__footer'
-                    + ', .dialog-test .el-dialog__footer'));
-                if (btn) return btn;
-                const ifr = document.getElementById('tmDialog_iframe');
-                if (ifr && ifr.contentDocument) btn = scan(ifr.contentDocument);
-            } catch (e) {}
-            return btn || null;
-        },
-
-        realDelay() { return Settings.humanize ? randInt(1500, 3500) : 600; },
-
-        // 防挂机（比参考脚本每秒一次更拟人）
-        startKeepAlive() {
-            if (this.keepAliveTimer) return;
-            const loop = () => {
-                this.keepAliveTimer = setTimeout(() => {
-                    try {
-                        if (Settings.zhs && Settings.humanize && !this.isCourseLocked()) {
-                            document.dispatchEvent(new MouseEvent('mousemove', {
-                                bubbles: true, cancelable: true, view: window,
-                                clientX: randInt(40, Math.max(80, window.innerWidth - 40)),
-                                clientY: randInt(40, Math.max(80, window.innerHeight - 40))
-                            }));
-                        }
-                    } catch (e) {}
-                    loop();
-                }, randInt(25, 45) * 1000);
-            };
-            loop();
         }
     };
 
@@ -2685,7 +2649,6 @@
     const boot = () => {
         const host = (location.hostname || '').toLowerCase();
         const isChaoxingStudy = location.href.includes('/mycourse/studentstudy') || host.includes('chaoxing');
-
         if (isChaoxingStudy) {
             setInterval(() => { if (Settings.cx) initChaoxing(); }, 3000);
             initChaoxing();
@@ -2697,13 +2660,20 @@
             YXY.startKeepAlive();
         }
 
-        if (host.includes('zhihuishu')) {
-            setInterval(() => { ZHS.tick(); }, 1500);
-            setTimeout(() => ZHS.tick(), 2500);
-            ZHS.startKeepAlive();
-        }
     };
 
-    boot();
+    // @run-at document-start 时 DOM 尚未就绪：等 body 可用再启动引擎
+    // （面板/引擎都需要 document.body，过早启动会静默失效）
+    const startWhenReady = () => {
+        try {
+            if (document.body) { boot(); return; }
+        } catch (e) {}
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => { try { boot(); } catch (e) {} }, { once: true });
+        } else {
+            setTimeout(startWhenReady, 30);
+        }
+    };
+    startWhenReady();
 
 })();
